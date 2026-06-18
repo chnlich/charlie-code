@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "charlie-code"
+version = "0.1.0"
+description = "A minimal bash-only coding-agent prototype, modeled on mini-swe-agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "litellm",
+    "pyyaml",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+charlie-code = "main:main"
+
+# main.py (repo root) and the flat modules under src/ are all exposed as top-level
+# modules. `sources = ["src"]` strips the src/ prefix in built wheels; dev-mode-dirs
+# puts both "." (for main.py) and "src" (for agent/model/environment) on sys.path for
+# editable installs (`pip install -e .`). config/default.yaml ships next to agent.py.
+[tool.hatch.build.targets.wheel]
+include = ["main.py", "src"]
+sources = ["src"]
+dev-mode-dirs = [".", "src"]
