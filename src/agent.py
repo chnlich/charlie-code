@@ -35,6 +35,12 @@ def strip_bash_blocks(text):
     return _BASH_BLOCK_RE.sub("", text).strip()
 
 
+def is_completion(output):
+    """True iff the last non-empty line of output equals the completion sentinel."""
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    return bool(lines) and lines[-1] == COMPLETION_SENTINEL
+
+
 class Agent:
     def __init__(self, model, environment, templates, step_limit):
         self.model = model
@@ -74,13 +80,6 @@ class Agent:
             if len(blocks) > 1:
                 note = f"{len(blocks)} bash blocks found; executed only the first."
 
-            if COMPLETION_SENTINEL in command:
-                steps.append({"thought": thought, "command": command,
-                              "observation": "Task marked complete by the agent.",
-                              "returncode": 0, "note": note})
-                return {"task": task, "steps": steps, "completed": True,
-                        "n_steps": step_idx, "usage": self.model.usage()}
-
             result = self.environment.execute(command)
             observation = render(
                 self.templates["observation"],
@@ -93,6 +92,10 @@ class Agent:
             steps.append({"thought": thought, "command": command,
                           "observation": observation, "returncode": result["returncode"],
                           "note": note})
+
+            if is_completion(result["output"]):
+                return {"task": task, "steps": steps, "completed": True,
+                        "n_steps": step_idx, "usage": self.model.usage()}
 
         raise RuntimeError(
             f"Step limit ({self.step_limit}) exceeded without task completion."
