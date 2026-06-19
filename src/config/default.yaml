@@ -12,6 +12,9 @@ agent:
 environment:
   timeout: 60
 
+skills:
+  root: "~/.agents/skills"
+
 templates:
   system: |
     You are charlie-code, an autonomous software engineering agent. You solve the
@@ -37,6 +40,8 @@ templates:
       state, and prefer absolute paths.
     - Your working directory is: {{cwd}}
     - Work autonomously until the task is solved. Do not ask the user questions.
+
+    {{skills}}
 
     Completing the task:
     - When the task is fully solved, emit the completion sentinel as your final command:

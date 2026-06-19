@@ -10,6 +10,7 @@ import typer
 from agent import Agent, load_config
 from environment import Environment
 from model import Model
+from skills import load_skill_catalog
 
 
 def _print_trajectory(result):
@@ -36,6 +37,7 @@ def run(
     model: str = typer.Option(None, "--model", help="litellm model id override."),
     api_base: str = typer.Option(None, "--api-base", help="OpenAI-compatible API base URL override."),
     cwd: str = typer.Option(None, "--cwd", help="Repo directory the agent operates in (default: current dir)."),
+    skills_root: str = typer.Option(None, "--skills-root", help="Agent Skills root directory override."),
     steps: int = typer.Option(None, "--steps", help="Hard step limit override."),
 ):
     config = load_config()
@@ -44,6 +46,11 @@ def run(
     base_url = api_base or os.environ.get("CHARLIE_CODE_API_BASE") or config["model"]["api_base"]
     api_key = os.environ.get("CHARLIE_CODE_API_KEY", "EMPTY")
     working_dir = cwd or os.getcwd()
+    resolved_skills_root = (
+        skills_root
+        or os.environ.get("CHARLIE_CODE_SKILLS_ROOT")
+        or config["skills"]["root"]
+    )
     step_limit = steps if steps is not None else config["agent"]["step_limit"]
 
     agent = Agent(
@@ -51,6 +58,7 @@ def run(
         environment=Environment(cwd=working_dir, timeout=config["environment"]["timeout"]),
         templates=config["templates"],
         step_limit=step_limit,
+        skills_catalog=load_skill_catalog(resolved_skills_root),
     )
     result = agent.run(task)
     _print_trajectory(result)

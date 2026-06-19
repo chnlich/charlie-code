@@ -42,11 +42,12 @@ def is_completion(output):
 
 
 class Agent:
-    def __init__(self, model, environment, templates, step_limit):
+    def __init__(self, model, environment, templates, step_limit, skills_catalog=""):
         self.model = model
         self.environment = environment
         self.templates = templates
         self.step_limit = step_limit
+        self.skills_catalog = skills_catalog
         self.messages = []
 
     def run(self, task):
@@ -55,6 +56,7 @@ class Agent:
                 self.templates["system"],
                 cwd=self.environment.cwd,
                 completion_sentinel=COMPLETION_SENTINEL,
+                skills=self.skills_catalog,
             )},
             {"role": "user", "content": render(self.templates["instance"], task=task)},
         ]
