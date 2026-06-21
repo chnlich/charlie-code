@@ -42,12 +42,21 @@ def is_completion(output):
 
 
 class Agent:
-    def __init__(self, model, environment, templates, step_limit, skills_catalog=""):
+    def __init__(
+        self,
+        model,
+        environment,
+        templates,
+        step_limit,
+        skills_catalog="",
+        emit=None,
+    ):
         self.model = model
         self.environment = environment
         self.templates = templates
         self.step_limit = step_limit
         self.skills_catalog = skills_catalog
+        self.emit = emit
         self.messages = []
 
     def run(self, task):
@@ -66,6 +75,8 @@ class Agent:
             self.messages.append({"role": "assistant", "content": content})
             thought = strip_bash_blocks(content)
             blocks = parse_bash_blocks(content)
+            if self.emit and thought:
+                self.emit({"type": "thought", "step": step_idx, "text": thought})
 
             if not blocks:
                 observation = render(
@@ -78,11 +89,19 @@ class Agent:
                 continue
 
             command = blocks[0]
+            event_id = f"s-{step_idx}"
+            if self.emit:
+                self.emit({"type": "command", "step": step_idx,
+                           "id": event_id, "command": command})
             note = None
             if len(blocks) > 1:
                 note = f"{len(blocks)} bash blocks found; executed only the first."
 
             result = self.environment.execute(command)
+            if self.emit:
+                self.emit({"type": "observation", "step": step_idx,
+                           "id": event_id, "returncode": result["returncode"],
+                           "output": result["output"]})
             observation = render(
                 self.templates["observation"],
                 returncode=result["returncode"],
