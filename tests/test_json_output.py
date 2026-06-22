@@ -53,21 +53,32 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["write file", "--json", "--cwd", str(tmp_path), "--steps", "3"],
+        [
+            "write file",
+            "--json",
+            "--cwd",
+            str(tmp_path),
+            "--session-dir",
+            str(tmp_path / "sessions"),
+            "--steps",
+            "3",
+        ],
     )
 
     assert result.exit_code == 0
     events = _json_lines(result.stdout)
     assert [event["type"] for event in events] == [
+        "session",
         "thought",
         "command",
         "observation",
         "result",
     ]
-    assert events[1]["id"] == events[2]["id"] == "s-1"
-    assert events[1]["command"].startswith("printf hi > out.txt")
-    assert events[2]["returncode"] == 0
-    assert COMPLETION_SENTINEL in events[2]["output"]
+    assert set(events[0]) == {"type", "session_id"}
+    assert events[2]["id"] == events[3]["id"] == "s-1"
+    assert events[2]["command"].startswith("printf hi > out.txt")
+    assert events[3]["returncode"] == 0
+    assert COMPLETION_SENTINEL in events[3]["output"]
     assert events[-1]["completed"] is True
     assert events[-1]["usage"] == {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
     assert (tmp_path / "out.txt").read_text() == "hi"
@@ -78,11 +89,21 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["never complete", "--json", "--cwd", str(tmp_path), "--steps", "1"],
+        [
+            "never complete",
+            "--json",
+            "--cwd",
+            str(tmp_path),
+            "--session-dir",
+            str(tmp_path / "sessions"),
+            "--steps",
+            "1",
+        ],
     )
 
     assert result.exit_code != 0
     events = _json_lines(result.stdout)
+    assert events[0]["type"] == "session"
     assert events[-1]["type"] == "error"
     assert "Step limit (1) exceeded" in events[-1]["message"]
 
@@ -96,12 +117,22 @@ def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["fail", "--json", "--cwd", str(tmp_path), "--steps", "3"],
+        [
+            "fail",
+            "--json",
+            "--cwd",
+            str(tmp_path),
+            "--session-dir",
+            str(tmp_path / "sessions"),
+            "--steps",
+            "3",
+        ],
     )
 
     assert result.exit_code != 0
     events = _json_lines(result.stdout)
-    assert events == [{"type": "error", "message": "model exploded"}]
+    assert events[0]["type"] == "session"
+    assert events[1] == {"type": "error", "message": "model exploded"}
     assert "Traceback" not in result.stdout
 
 

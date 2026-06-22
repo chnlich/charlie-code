@@ -15,6 +15,9 @@ environment:
 skills:
   root: "~/.agents/skills"
 
+session:
+  dir: "~/.charlie-code/sessions"
+
 templates:
   system: |
     You are charlie-code, an autonomous software engineering agent. You solve the

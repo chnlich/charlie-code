@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import sys
+import uuid
 
 import typer
 
@@ -47,6 +48,10 @@ def run(
     skills_root: str = typer.Option(
         None, "--skills-root", help="Agent Skills root directory override."
     ),
+    resume: str = typer.Option(None, "--resume", help="Resume a previous session id."),
+    session_dir: str = typer.Option(
+        None, "--session-dir", help="Session state directory override."
+    ),
     steps: int = typer.Option(None, "--steps", help="Hard step limit override."),
     json_output: bool = typer.Option(
         False,
@@ -78,6 +83,14 @@ def run(
         or os.environ.get("CHARLIE_CODE_SKILLS_ROOT")
         or config["skills"]["root"]
     )
+    resolved_session_dir = os.path.expanduser(
+        session_dir
+        or os.environ.get("CHARLIE_CODE_SESSION_DIR")
+        or config["session"]["dir"]
+    )
+    os.makedirs(resolved_session_dir, exist_ok=True)
+    session_id = resume or str(uuid.uuid4())
+    state_file = os.path.join(resolved_session_dir, f"{session_id}.json")
     step_limit = steps if steps is not None else config["agent"]["step_limit"]
 
     agent = Agent(
@@ -87,9 +100,12 @@ def run(
         step_limit=step_limit,
         skills_catalog=load_skill_catalog(resolved_skills_root),
         emit=_emit,
+        state_file=state_file,
+        resume=resume is not None,
     )
 
     if json_output:
+        _emit({"type": "session", "session_id": session_id})
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 result = agent.run(task)

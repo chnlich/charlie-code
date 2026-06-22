@@ -40,6 +40,10 @@ charlie-code "<task>" [--model M] [--api-base URL] [--cwd DIR] [--steps N]
 
 - `--cwd` is the repo the agent operates in (default: current directory).
 - `--steps` is the hard step limit (default: 40). Exceeding it fails loudly.
+- Each run gets a session id and writes message history to
+  `~/.charlie-code/sessions/<session_id>.json` by default.
+- Use `--resume <session_id>` to append a new task to an existing session history.
+- Use `--session-dir DIR` to override the session store directory.
 
 Example:
 
@@ -78,6 +82,7 @@ Override precedence is **CLI flag > environment variable > YAML default**:
 
 - model: `--model` / `CHARLIE_CODE_MODEL`
 - api base: `--api-base` / `CHARLIE_CODE_API_BASE`
+- session dir: `--session-dir` / `CHARLIE_CODE_SESSION_DIR`
 - api key: `CHARLIE_CODE_API_KEY` (default `"EMPTY"` — the SGLang server does not
   require a key, so a placeholder is sent).
 

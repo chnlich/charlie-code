@@ -5,7 +5,10 @@ exactly one fenced ```bash block from it, run that command, and feed the result 
 as the next observation. The model finishes by emitting the completion sentinel.
 """
 
+import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -50,6 +53,8 @@ class Agent:
         step_limit,
         skills_catalog="",
         emit=None,
+        state_file=None,
+        resume=False,
     ):
         self.model = model
         self.environment = environment
@@ -57,10 +62,20 @@ class Agent:
         self.step_limit = step_limit
         self.skills_catalog = skills_catalog
         self.emit = emit
+        self.state_file = state_file
+        self.resume = resume
         self.messages = []
 
-    def run(self, task):
-        self.messages = [
+    def _initial_messages(self, task):
+        if self.resume and self.state_file and Path(self.state_file).exists():
+            messages = json.loads(Path(self.state_file).read_text())
+            messages.append({
+                "role": "user",
+                "content": render(self.templates["instance"], task=task),
+            })
+            return messages
+
+        return [
             {"role": "system", "content": render(
                 self.templates["system"],
                 cwd=self.environment.cwd,
@@ -69,55 +84,79 @@ class Agent:
             )},
             {"role": "user", "content": render(self.templates["instance"], task=task)},
         ]
+
+    def _persist_messages(self):
+        if self.state_file is None:
+            return
+
+        state_path = Path(self.state_file)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=str(state_path.parent),
+            prefix=f".{state_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            json.dump(self.messages, tmp)
+            tmp.write("\n")
+            tmp_path = tmp.name
+
+        os.replace(tmp_path, state_path)
+
+    def run(self, task):
+        self.messages = self._initial_messages(task)
         steps = []
-        for step_idx in range(1, self.step_limit + 1):
-            content = self.model.query(self.messages)
-            self.messages.append({"role": "assistant", "content": content})
-            thought = strip_bash_blocks(content)
-            blocks = parse_bash_blocks(content)
-            if self.emit and thought:
-                self.emit({"type": "thought", "step": step_idx, "text": thought})
+        try:
+            for step_idx in range(1, self.step_limit + 1):
+                content = self.model.query(self.messages)
+                self.messages.append({"role": "assistant", "content": content})
+                thought = strip_bash_blocks(content)
+                blocks = parse_bash_blocks(content)
+                if self.emit and thought:
+                    self.emit({"type": "thought", "step": step_idx, "text": thought})
 
-            if not blocks:
+                if not blocks:
+                    observation = render(
+                        self.templates["format_reminder"],
+                        completion_sentinel=COMPLETION_SENTINEL,
+                    )
+                    self.messages.append({"role": "user", "content": observation})
+                    steps.append({"thought": thought, "command": None,
+                                  "observation": observation, "note": "no bash block"})
+                    continue
+
+                command = blocks[0]
+                event_id = f"s-{step_idx}"
+                if self.emit:
+                    self.emit({"type": "command", "step": step_idx,
+                               "id": event_id, "command": command})
+                note = None
+                if len(blocks) > 1:
+                    note = f"{len(blocks)} bash blocks found; executed only the first."
+
+                result = self.environment.execute(command)
+                if self.emit:
+                    self.emit({"type": "observation", "step": step_idx,
+                               "id": event_id, "returncode": result["returncode"],
+                               "output": result["output"]})
                 observation = render(
-                    self.templates["format_reminder"],
-                    completion_sentinel=COMPLETION_SENTINEL,
+                    self.templates["observation"],
+                    returncode=result["returncode"],
+                    output=result["output"] or "<no output>",
                 )
+                if note:
+                    observation = f"[{note}]\n{observation}"
                 self.messages.append({"role": "user", "content": observation})
-                steps.append({"thought": thought, "command": None,
-                              "observation": observation, "note": "no bash block"})
-                continue
+                steps.append({"thought": thought, "command": command,
+                              "observation": observation, "returncode": result["returncode"],
+                              "note": note})
 
-            command = blocks[0]
-            event_id = f"s-{step_idx}"
-            if self.emit:
-                self.emit({"type": "command", "step": step_idx,
-                           "id": event_id, "command": command})
-            note = None
-            if len(blocks) > 1:
-                note = f"{len(blocks)} bash blocks found; executed only the first."
+                if is_completion(result["output"]):
+                    return {"task": task, "steps": steps, "completed": True,
+                            "n_steps": step_idx, "usage": self.model.usage()}
 
-            result = self.environment.execute(command)
-            if self.emit:
-                self.emit({"type": "observation", "step": step_idx,
-                           "id": event_id, "returncode": result["returncode"],
-                           "output": result["output"]})
-            observation = render(
-                self.templates["observation"],
-                returncode=result["returncode"],
-                output=result["output"] or "<no output>",
+            raise RuntimeError(
+                f"Step limit ({self.step_limit}) exceeded without task completion."
             )
-            if note:
-                observation = f"[{note}]\n{observation}"
-            self.messages.append({"role": "user", "content": observation})
-            steps.append({"thought": thought, "command": command,
-                          "observation": observation, "returncode": result["returncode"],
-                          "note": note})
-
-            if is_completion(result["output"]):
-                return {"task": task, "steps": steps, "completed": True,
-                        "n_steps": step_idx, "usage": self.model.usage()}
-
-        raise RuntimeError(
-            f"Step limit ({self.step_limit}) exceeded without task completion."
-        )
+        finally:
+            self._persist_messages()
