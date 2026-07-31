@@ -212,6 +212,15 @@ def run_episode(task, model_cfg, work_dir, episode_timeout):
     child_env = dict(os.environ)
     child_env["CHARLIE_CODE_API_KEY"] = model_cfg["api_key"]
     child_env["LITELLM_LOG"] = "ERROR"
+    # Force main/agent/model/environment to resolve from this repo, not from
+    # whichever checkout the interpreter's editable install happens to point
+    # at: PYTHONPATH is searched before site-packages .pth entries, so this
+    # keeps episodes honest about which charlie-code they are measuring.
+    repo_paths = [str(REPO_ROOT), str(REPO_ROOT / "src")]
+    existing_pythonpath = child_env.get("PYTHONPATH")
+    if existing_pythonpath:
+        repo_paths.append(existing_pythonpath)
+    child_env["PYTHONPATH"] = os.pathsep.join(repo_paths)
     start = time.perf_counter()
     try:
         proc = subprocess.run(

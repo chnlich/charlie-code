@@ -52,10 +52,12 @@ Let `Delta` = (solved this iteration) - (solved at baseline).
 - `Delta >= 3`: keep the change, commit, update the baseline to this run.
 - `Delta in {1, 2}`: rerun only the flipped tasks once. Keep the change only if the
   flips reproduce; otherwise revert.
-- `Delta <= 0`: revert the change.
-- `Delta == 0`: zero progress is acceptable. Record it (commit a note or leave the
-  run in place) and stop this iteration; do not pile on more changes to force
-  progress.
+- `Delta <= 0`: revert the change (including `Delta == 0`).
+
+Zero progress is an acceptable outcome across an iteration: it is not a failure,
+and it does not license piling more changes onto the same iteration to force a
+result. Whether an iteration is kept or reverted, record what was tried and what
+`Delta` came out to (e.g. a short commit note), then move to the next iteration.
 
 After the final iteration, rerun the accepted state on `kimi-k3` once to confirm
 any gain is not single-model-specific, and render the comparison with
