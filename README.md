@@ -112,10 +112,10 @@ pytest tests/
 The smoke test exercises the full loop and bash-block parsing with `model.query`
 monkeypatched to return canned responses (including the completion sentinel). It never
 touches the network or the SGLang server.
-
 ## Manual live run
 
-To try a real run against the endpoint (requires the SGLang server to be reachable):
+To try a real run against the endpoint (requires the SGLang server to be
+reachable):
 
 ```bash
 # check reachability first
@@ -125,3 +125,55 @@ mkdir -p /tmp/cc_demo
 charlie-code "create a file hello.txt containing hi, then finish" --cwd /tmp/cc_demo --steps 10
 cat /tmp/cc_demo/hello.txt   # -> hi
 ```
+
+## Evaluation harness (`evals/`)
+
+`evals/` is a plain-scripts directory (not an installable package) that measures
+charlie-code's task resolve rate. It contains a model registry, a batch runner,
+a report generator, the improve-loop goal file, and per-task suites.
+
+### Model endpoints
+
+No endpoint values live in the repo. The runner resolves them from the
+environment with precedence **process env > `~/.charlie-code/evals.env` > hard
+failure**. Set these before running (the key is optional and defaults to
+`EMPTY`):
+
+| variable                | meaning                                   |
+| ----------------------- | ----------------------------------------- |
+| `CC_EVAL_GLM52_MODEL`   | litellm model id for the GLM-5.2 endpoint  |
+| `CC_EVAL_GLM52_BASE`    | OpenAI-compatible base URL (`.../v1`)      |
+| `CC_EVAL_KIMI_K3_MODEL` | litellm model id for the Kimi-K3 endpoint |
+| `CC_EVAL_KIMI_K3_BASE`  | OpenAI-compatible base URL (`.../v1`)      |
+| `CC_EVAL_API_KEY`       | shared api key (optional; default `EMPTY`) |
+
+`evals/models.yaml` maps the logical ids `glm52` and `kimi-k3` to these
+variable names.
+
+### Commands
+
+```bash
+# null-check: run every grader against a pristine fixture, no model calls.
+# Exits 0 only if every task is judged unresolved.
+python evals/run.py --suite dev --null-check
+
+# baseline / iteration run: one episode per task, then grade.
+python evals/run.py --suite dev --model glm52 [--k 1] [--parallel 4] --out runs/<id>
+
+# render a self-contained HTML report from one or more summaries.
+python evals/report.py runs/<id>/summary.json [-o report.html]
+python evals/report.py runs/a/summary.json runs/b/summary.json -o runs/delta.html
+```
+
+### Outputs
+
+- `runs/<id>/summary.json` — schema: `{model, suite, k, resolved, total,
+  resolve_rate, wilson_ci95, per_task: [{id, resolve_frac, runs: [{resolved,
+  steps, tokens_in, tokens_out, wall_s, fail_class}]}]}`. `fail_class` is one of
+  `step_limit` / `env_error` / `wrong_answer` / `infra` (null when resolved).
+- `runs/<id>/traj/<task_id>.<rep>.ndjson` — the raw NDJSON event stream per
+  (task, repeat) episode. Steps and tokens are parsed from the `result` event
+  only.
+
+`runs/` is gitignored. The improve-loop goal file at `evals/loop/goal.md` drives
+the `charliebot improve` cycle against this harness.

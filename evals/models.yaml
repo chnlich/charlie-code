@@ -1,0 +1,23 @@
+# Model registry for the evals harness.
+#
+# Logical model ids map to the environment variables that supply the real endpoint
+# values at run time. No host addresses, model paths, or credentials ever live in
+# this repo: the runner resolves them from the process environment (precedence:
+# process env > ~/.charlie-code/evals.env > hard failure naming the missing var).
+#
+#   CC_EVAL_GLM52_MODEL   litellm model id for the GLM-5.2 endpoint
+#   CC_EVAL_GLM52_BASE    OpenAI-compatible base URL for GLM-5.2 (.../v1)
+#   CC_EVAL_KIMI_K3_MODEL litellm model id for the Kimi-K3 endpoint
+#   CC_EVAL_KIMI_K3_BASE  OpenAI-compatible base URL for Kimi-K3 (.../v1)
+#   CC_EVAL_API_KEY       shared api key (optional; defaults to EMPTY)
+
+api_key_env: CC_EVAL_API_KEY
+api_key_default: EMPTY
+
+models:
+  glm52:
+    model_env: CC_EVAL_GLM52_MODEL
+    base_env: CC_EVAL_GLM52_BASE
+  kimi-k3:
+    model_env: CC_EVAL_KIMI_K3_MODEL
+    base_env: CC_EVAL_KIMI_K3_BASE
