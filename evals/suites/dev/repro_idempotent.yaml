@@ -1,0 +1,13 @@
+id: repro_idempotent
+prompt: |
+  pipeline.py reads input.txt and writes processed records to output.txt.
+  The script opens output.txt in append mode ("a"), so running it twice
+  doubles the output instead of producing the same result. Fix pipeline.py
+  so it is idempotent: running it multiple times on the same input produces
+  the same output.txt every time. Do not change input.txt. See TASK.md in
+  the working directory for details.
+fixture: fixtures/repro_idempotent
+grade: grade/repro_idempotent.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, reproducibility, data-processing]

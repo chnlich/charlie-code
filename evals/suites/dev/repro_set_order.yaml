@@ -1,0 +1,14 @@
+id: repro_set_order
+prompt: |
+  process.py reads data.txt, groups records by their key (first column), and
+  writes the groups to output.txt. The values within each group are stored in
+  a Python set, and the script joins them with ",".join(set) — but set
+  iteration order for strings is randomized by PYTHONHASHSEED, so the output
+  differs from run to run. Fix process.py so the output is byte-identical
+  across runs regardless of PYTHONHASHSEED. Do not change data.txt. See
+  TASK.md in the working directory for details.
+fixture: fixtures/repro_set_order
+grade: grade/repro_set_order.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, reproducibility, data-processing]

@@ -1,0 +1,12 @@
+id: repro_timestamp
+prompt: |
+  generate_report.py reads data.txt and writes a text report to report.txt.
+  The report includes a line with time.time() (the current wall-clock
+  timestamp), so the output changes on every run and is not reproducible.
+  Fix generate_report.py so the output is byte-identical across runs. Do
+  not change data.txt. See TASK.md in the working directory for details.
+fixture: fixtures/repro_timestamp
+grade: grade/repro_timestamp.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, reproducibility, data-processing]

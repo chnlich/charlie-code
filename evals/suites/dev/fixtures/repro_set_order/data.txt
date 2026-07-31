@@ -1,0 +1,11 @@
+fruit,apple
+fruit,banana
+fruit,cherry
+fruit,date
+veg,carrot
+veg,broccoli
+veg,spinach
+grain,rice
+grain,wheat
+grain,oats
+grain,barley
