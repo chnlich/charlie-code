@@ -1,0 +1,14 @@
+id: speedup_pair_count
+prompt: |
+  solution.py contains a correct but slow O(n^2) implementation of
+  count_pairs(values, target) that returns the number of index pairs (i, j)
+  with i < j and values[i] + values[j] == target. Rewrite it so it is still
+  correct AND at least 10x faster on a 10000-element benchmark, keeping the
+  same function name and signature. Do not use any third-party library; the
+  standard library is allowed. See TASK.md in the working directory for
+  details.
+fixture: fixtures/speedup_pair_count
+grade: grade/speedup_pair_count.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, speedup, performance]

@@ -1,0 +1,15 @@
+id: speedup_range_query
+prompt: |
+  solution.py contains a correct but slow implementation of
+  range_sum(arr, queries) that takes an array and a list of (lo, hi) index
+  pairs and returns a list of the sums of arr[lo..hi] (inclusive). The
+  current implementation is O(n * q) because it re-sums each range from
+  scratch. Rewrite it so it is still correct AND at least 10x faster on a
+  10000-element array with 10000 queries, keeping the same function name
+  and signature. Do not use any third-party library; the standard library
+  is allowed. See TASK.md in the working directory for details.
+fixture: fixtures/speedup_range_query
+grade: grade/speedup_range_query.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, speedup, performance]
