@@ -1,0 +1,15 @@
+id: fault_metric_divzero
+prompt: |
+  A metrics computation script crashes with ZeroDivisionError when evaluating
+  edge cases. The functions precision, recall, and f1_score in metrics.py
+  divide by their denominators without guarding against zero. When there
+  are no positive predictions (tp + fp == 0) or no positive ground truth
+  (tp + fn == 0), the division crashes. Fix metrics.py so the functions
+  return 0.0 when the denominator is zero, and are correct for normal cases.
+  Do not change evaluate.py. See TASK.md in the working directory for
+  details.
+fixture: fixtures/fault_metric_divzero
+grade: grade/fault_metric_divzero.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, fault-localization, edge-case]

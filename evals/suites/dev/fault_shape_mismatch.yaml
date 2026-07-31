@@ -1,0 +1,14 @@
+id: fault_shape_mismatch
+prompt: |
+  A 2-layer MLP forward pass crashes with an IndexError when run. The bug is
+  in model.py: the forward function accesses the weight matrix W2 with
+  transposed indices (W2[i][k] instead of W2[k][i]), which goes out of bounds
+  because the hidden dimension (3) exceeds the output dimension (2). Find
+  the bug in model.py and fix the index order so that python run.py runs to
+  completion and prints the correct output. Do not change init_weights or
+  the network architecture. See TASK.md in the working directory for details.
+fixture: fixtures/fault_shape_mismatch
+grade: grade/fault_shape_mismatch.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, fault-localization, indexing]
