@@ -1,0 +1,13 @@
+id: tensor_matmul
+prompt: |
+  Implement matrix multiplication in solution.py. The function matmul(a, b) takes
+  two matrices as lists of lists (a is m x k, b is k x n) and must return their
+  product as a list of lists (m x n) of floats, using a plain triple loop. Do
+  not use numpy or any third-party library. It must work for square and
+  rectangular matrices and for integer inputs. See TASK.md in the working
+  directory for the full contract and the cases the grader checks.
+fixture: fixtures/tensor_matmul
+grade: grade/tensor_matmul.py
+timeout_s: 60
+step_limit: 20
+tags: [pilot, tensor-op, correctness]

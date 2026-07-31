@@ -1,0 +1,13 @@
+id: speedup_dedup
+prompt: |
+  solution.py contains a correct but slow O(n^2) implementation of
+  count_unique(values) that returns the number of distinct values in a list.
+  Rewrite it so it is still correct AND at least 10x faster on a 10000-element
+  benchmark, keeping the same function name and signature. Do not use any
+  third-party library; the standard library is allowed. See TASK.md in the
+  working directory for details.
+fixture: fixtures/speedup_dedup
+grade: grade/speedup_dedup.py
+timeout_s: 60
+step_limit: 20
+tags: [pilot, speedup, performance]
