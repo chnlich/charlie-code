@@ -1,0 +1,15 @@
+id: train_grad_sign
+prompt: |
+  A gradient descent training script is diverging instead of converging. The
+  script trains a simple linear model y = w * x on the data in train.py (where
+  y = 2 * x) by calling model.gradient(w, x, y) to get the gradient of the MSE
+  loss. The gradient function in model.py has the wrong sign, so the update
+  moves the weight away from the optimum. Fix model.py so the gradient has the
+  correct sign, keeping the same function name and signature. Do not change
+  the data, the learning rate, or the number of epochs in train.py. See
+  TASK.md in the working directory for details.
+fixture: fixtures/train_grad_sign
+grade: grade/train_grad_sign.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, training, fix]

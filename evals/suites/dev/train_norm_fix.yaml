@@ -1,0 +1,15 @@
+id: train_norm_fix
+prompt: |
+  train.py runs linear regression via gradient descent on a dataset where the
+  two features have very different scales (feature 1 in [0, 1], feature 2 in
+  [0, 100]). The learning rate (0.001) is too large for the wide-scale
+  feature, so the loss diverges to infinity. Fix the feature scaling in
+  train.py so that gradient descent converges and the final MSE loss drops
+  below 0.5. The printed weights and final_loss must be in the original
+  (un-normalized) feature space. Keep the dataset generation unchanged.
+  See TASK.md in the working directory for details.
+fixture: fixtures/train_norm_fix
+grade: grade/train_norm_fix.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, training, fix]

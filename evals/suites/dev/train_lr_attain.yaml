@@ -1,0 +1,15 @@
+id: train_lr_attain
+prompt: |
+  train.py runs logistic regression on a fixed binary classification dataset
+  but the learning rate (0.001) and number of epochs (50) are too small, so
+  the final loss stays around 0.64 — well above the target of 0.3. Tune the
+  learning rate and/or the number of epochs in train.py so that the final
+  loss drops below 0.3. Keep the dataset generation, the loss function, and
+  the gradient computation unchanged. The script must still print
+  "weights:w0,w1,w2" and "final_loss:X". See TASK.md in the working
+  directory for details.
+fixture: fixtures/train_lr_attain
+grade: grade/train_lr_attain.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, training, attain]
