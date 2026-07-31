@@ -1,0 +1,17 @@
+id: tensor_layernorm
+prompt: |
+  Implement layer normalization in solution.py. The function
+  layernorm(x, gamma, beta, eps=1e-5) takes a batch of vectors x as a list of
+  lists (batch x dim), a per-feature scale gamma (list of length dim), a
+  per-feature shift beta (list of length dim), and an epsilon eps. It must
+  return a list of lists (batch x dim) of floats where each row is normalized
+  to zero mean and unit variance over the last dimension, then scaled by
+  gamma and shifted by beta. Use plain Python; do not use numpy or any
+  third-party library. The implementation must be numerically stable for
+  large input values. See TASK.md in the working directory for the full
+  contract and the cases the grader checks.
+fixture: fixtures/tensor_layernorm
+grade: grade/tensor_layernorm.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, tensor-op, correctness]

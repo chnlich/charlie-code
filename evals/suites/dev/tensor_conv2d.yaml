@@ -1,0 +1,14 @@
+id: tensor_conv2d
+prompt: |
+  Implement 2D convolution in solution.py. The function conv2d(image, kernel)
+  takes a grayscale image as a list of lists (H x W) and a kernel as a list of
+  lists (kh x kw) and must return the valid-padded convolution result as a list
+  of lists ((H-kh+1) x (W-kw+1)) of floats, using nested loops. Do not use
+  numpy or any third-party library. It must work for square and rectangular
+  kernels, and for integer inputs. See TASK.md in the working directory for
+  the full contract and the cases the grader checks.
+fixture: fixtures/tensor_conv2d
+grade: grade/tensor_conv2d.py
+timeout_s: 60
+step_limit: 20
+tags: [dev, tensor-op, correctness]
