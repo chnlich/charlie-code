@@ -27,8 +27,8 @@ baseline before each iteration.
   addition, or a budget parameter in `src/`), then run the acceptance command.
 - Real model episodes use the pinned interpreter. The environment variables
   `CC_EVAL_GLM52_*` / `CC_EVAL_KIMI_K3_*` / `CC_EVAL_API_KEY` supply the
-  endpoints; if they are missing, that is a blocker, not something to fix by
-  editing the harness.
+  endpoints, and `CC_EVAL_PYTHON` supplies the episode interpreter; if any are
+  missing, that is a blocker, not something to fix by editing the harness.
 
 ## Acceptance command sequence (run every iteration)
 

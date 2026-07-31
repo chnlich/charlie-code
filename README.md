@@ -150,6 +150,10 @@ failure**. Set these before running (the key is optional and defaults to
 `evals/models.yaml` maps the logical ids `glm52` and `kimi-k3` to these
 variable names.
 
+`CC_EVAL_PYTHON` (optional) overrides the interpreter used to run episode
+subprocesses, falling back to the runner's own interpreter when unset (same
+env precedence chain as the endpoint vars).
+
 ### Commands
 
 ```bash

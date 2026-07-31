@@ -112,6 +112,28 @@ def resolve_model(models_cfg, logical_id, env_file=DEFAULT_ENV_FILE, env=None):
     }
 
 
+def resolve_episode_interpreter(env_file=DEFAULT_ENV_FILE, env=None):
+    """Resolve the interpreter for episode subprocesses.
+
+    Precedence is process env > ~/.charlie-code/evals.env > the current
+    interpreter (sys.executable). A set-but-nonexistent CC_EVAL_PYTHON is a
+    hard error naming the variable, never a silent fallback: a bare
+    `python evals/run.py` must not silently measure episodes under a broken
+    or wrong interpreter.
+    """
+    env = dict(env if env is not None else os.environ)
+    file_values = _read_env_file(env_file)
+    value = env.get("CC_EVAL_PYTHON") or file_values.get("CC_EVAL_PYTHON")
+    if not value:
+        return sys.executable
+    if not Path(value).is_file():
+        raise SystemExit(
+            f"CC_EVAL_PYTHON points to a nonexistent interpreter: {value!r} "
+            f"(set it in the process env or in {env_file})"
+        )
+    return value
+
+
 def check_reachable(model_cfg, timeout=10.0):
     """GET <api_base>/models once. Returns True on 200, False otherwise."""
     base = model_cfg["api_base"].rstrip("/")
@@ -196,12 +218,12 @@ def _parse_result_event(ndjson_text):
     return result, error
 
 
-def run_episode(task, model_cfg, work_dir, episode_timeout):
+def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter):
     """Run one charlie-code episode non-interactively; return (ndjson, fail_class, wall_s)."""
     session_dir = work_dir / ".cc-sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
     argv = [
-        sys.executable, "-m", "main", "--json",
+        interpreter, "-m", "main", "--json",
         "--cwd", str(work_dir),
         "--model", model_cfg["model_name"],
         "--api-base", model_cfg["api_base"],
@@ -341,13 +363,13 @@ def aggregate(model_id, suite, k, per_task_runs):
 # Batch runners
 # --------------------------------------------------------------------------- #
 
-def _run_one(task, rep, model_cfg, out_dir, traj_dir):
+def _run_one(task, rep, model_cfg, out_dir, traj_dir, interpreter):
     """Run one (task, repeat) pair and write its trajectory. Returns the run record."""
     with tempfile.TemporaryDirectory(prefix=f"eval-{task['id']}-") as work_dir:
         work_dir = Path(work_dir)
         materialize_fixture(task["_fixture"], work_dir)
         episode_timeout = max(task["step_limit"] * 120, 600)
-        ndjson, ep_fail, ep_wall = run_episode(task, model_cfg, work_dir, episode_timeout)
+        ndjson, ep_fail, ep_wall = run_episode(task, model_cfg, work_dir, episode_timeout, interpreter)
         traj_path = traj_dir / f"{task['id']}.{rep}.ndjson"
         traj_path.write_text(ndjson)
         grader_exit, grader_fail = run_grader(task["_grade"], work_dir, task["timeout_s"])
@@ -361,6 +383,7 @@ def run_batch(suite_dir, models_path, model_id, k, parallel, out, env_file=DEFAU
     tasks = load_suite(suite_dir)
     models_cfg = load_models(models_path)
     model_cfg = resolve_model(models_cfg, model_id, env_file=env_file)
+    episode_python = resolve_episode_interpreter(env_file=env_file)
 
     if not check_reachable(model_cfg):
         raise SystemExit(
@@ -378,7 +401,7 @@ def run_batch(suite_dir, models_path, model_id, k, parallel, out, env_file=DEFAU
     def _work(unit):
         task, rep = unit
         try:
-            tid, r, record = _run_one(task, rep, model_cfg, out_dir, traj_dir)
+            tid, r, record = _run_one(task, rep, model_cfg, out_dir, traj_dir, episode_python)
             return tid, r, record
         except Exception as exc:  # one task's crash never aborts the batch
             record = {

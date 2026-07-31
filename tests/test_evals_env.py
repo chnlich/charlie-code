@@ -1,5 +1,7 @@
 """Env resolution precedence and missing-variable reporting for evals/run.py."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from evals_helper import load_script
@@ -77,3 +79,56 @@ def test_resolve_model_unknown_id_is_rejected(tmp_path):
     env_file = tmp_path / "evals.env"
     with pytest.raises(SystemExit, match="unknown model id"):
         run.resolve_model(_models_cfg(), "nope", env_file=env_file, env={})
+
+
+def test_resolve_episode_interpreter_unset_falls_back_to_sys_executable(tmp_path):
+    env_file = tmp_path / "absent.env"
+    interp = run.resolve_episode_interpreter(env_file=env_file, env={})
+    assert interp == run.sys.executable
+
+
+def test_resolve_episode_interpreter_process_env_beats_file(tmp_path):
+    env_file = tmp_path / "evals.env"
+    env_file.write_text("CC_EVAL_PYTHON=from-file\n")
+    fake = tmp_path / "from-process"
+    fake.write_text("")
+    interp = run.resolve_episode_interpreter(
+        env_file=env_file, env={"CC_EVAL_PYTHON": str(fake)},
+    )
+    assert interp == str(fake)
+    assert interp != run.sys.executable
+
+
+def test_resolve_episode_interpreter_file_fills_when_process_unset(tmp_path):
+    env_file = tmp_path / "evals.env"
+    fake = tmp_path / "from-file"
+    fake.write_text("")
+    env_file.write_text(f"CC_EVAL_PYTHON={fake}\n")
+    interp = run.resolve_episode_interpreter(env_file=env_file, env={})
+    assert interp == str(fake)
+
+
+def test_resolve_episode_interpreter_nonexistent_is_hard_error(tmp_path):
+    env_file = tmp_path / "absent.env"
+    bogus = str(tmp_path / "no-such-interpreter")
+    with pytest.raises(SystemExit, match="CC_EVAL_PYTHON"):
+        run.resolve_episode_interpreter(env_file=env_file, env={"CC_EVAL_PYTHON": bogus})
+
+
+def test_run_episode_argv_uses_resolved_interpreter(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return SimpleNamespace(
+            stdout='{"type": "result", "completed": true, "n_steps": 0, "usage": {}}',
+            returncode=0,
+        )
+
+    monkeypatch.setattr(run.subprocess, "run", fake_run)
+    task = {"id": "t", "prompt": "do it", "step_limit": 1}
+    model_cfg = {"model_name": "m", "api_base": "http://h/v1", "api_key": "EMPTY"}
+    fake_interp = str(tmp_path / "episode-python")
+    run.run_episode(task, model_cfg, tmp_path, 60, fake_interp)
+    assert captured["argv"][0] == fake_interp
+    assert captured["argv"][1:4] == ["-m", "main", "--json"]

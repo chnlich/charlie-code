@@ -10,6 +10,7 @@
 #   CC_EVAL_KIMI_K3_MODEL litellm model id for the Kimi-K3 endpoint
 #   CC_EVAL_KIMI_K3_BASE  OpenAI-compatible base URL for Kimi-K3 (.../v1)
 #   CC_EVAL_API_KEY       shared api key (optional; defaults to EMPTY)
+#   CC_EVAL_PYTHON        interpreter for episode subprocesses (optional; defaults to the running interpreter)
 
 api_key_env: CC_EVAL_API_KEY
 api_key_default: EMPTY
