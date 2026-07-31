@@ -1,12 +1,13 @@
-"""litellm wrapper around the your-model SGLang endpoint with simple usage tracking.
+"""litellm wrapper around the configured OpenAI-compatible endpoint.
 
-your-model returns its chain-of-thought in a separate `reasoning_content` field; we
-deliberately read ONLY the main message `content` and ignore the reasoning.
+`query` hands back the assistant message exactly as the endpoint sent it, plus the
+envelope's finish reason. The whole message is what goes back on the next turn:
+Kimi K3 is trained in preserved-thinking-history mode and needs `reasoning_content`
+and `tool_calls` returned as-is, not just `content`.
 
-SGLang has no GLM-specific reasoning parser, so reasoning sometimes leaks into
-`content` as an orphan closing `</think>` or a full `<think>...</think>` block (see
-SGLang issue #4711). We strip it client-side; legitimate agent output (THOUGHT +
-```bash``` block) never contains `</think>`, so this is safe.
+Some endpoints still leak reasoning into `content` as an orphan closing `</think>`
+(SGLang issue #4711). `strip_leaked_reasoning` cleans that up for display text only;
+the message stored in the conversation stays byte-for-byte what the endpoint sent.
 """
 
 import litellm
@@ -21,6 +22,18 @@ def strip_leaked_reasoning(content):
     return content[idx + len(marker):].lstrip()
 
 
+def as_message_dict(message):
+    """Plain dict of an assistant message, keeping every field the endpoint sent.
+
+    Unset fields are dropped so a `"tool_calls": null` never travels back out.
+    """
+    for attr in ("model_dump", "dict"):
+        dump = getattr(message, attr, None)
+        if callable(dump):
+            return {key: value for key, value in dump().items() if value is not None}
+    return {key: value for key, value in dict(message).items() if value is not None}
+
+
 class Model:
     def __init__(self, model_name, api_base, api_key):
         self.model_name = model_name
@@ -30,11 +43,12 @@ class Model:
         self.input_tokens = 0
         self.output_tokens = 0
 
-    def query(self, messages):
-        """Send the conversation and return the assistant's message content."""
+    def query(self, messages, tools=None):
+        """Send the conversation and return (assistant message, finish_reason)."""
         response = litellm.completion(
             model=self.model_name,
             messages=messages,
+            tools=tools,
             api_base=self.api_base,
             api_key=self.api_key,
             extra_body={"separate_reasoning": True},
@@ -43,8 +57,8 @@ class Model:
         usage = response.usage
         self.input_tokens += usage.prompt_tokens
         self.output_tokens += usage.completion_tokens
-        # Use only the main content; reasoning_content is ignored on purpose.
-        return strip_leaked_reasoning(response.choices[0].message.content or "")
+        choice = response.choices[0]
+        return as_message_dict(choice.message), choice.finish_reason
 
     def usage(self):
         return {

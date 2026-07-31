@@ -1,46 +1,42 @@
-"""Smoke test for the agent loop and bash-block parsing, with the model MOCKED.
+"""Smoke test for the agent loop end to end, with the model MOCKED.
 
-No network or SGLang server is touched: we construct a real Model (cheap, no I/O at
-construction time) and monkeypatch its `query` to return canned responses, ending
-with the completion sentinel.
+Covers one full shape of a run: an empty reply that must not end the session, a real
+bash call, and a final text answer that does.
 """
 
-from agent import COMPLETION_SENTINEL, Agent, load_config
+from agent import Agent, load_config
+from conftest import ScriptedModel, assistant, tool_call
 from environment import Environment
-from model import Model
 
 
-def test_loop_parses_bash_and_completes(tmp_path, monkeypatch):
-    responses = iter([
-        # 1) No bash block -> should trigger the format reminder, not crash.
-        "I will start now.",
-        # 2) A real command that creates a file.
-        "Let me create the file.\n```bash\necho hi > out.txt\n```",
-        # 3) Completion sentinel -> ends the session.
-        f"All done.\n```bash\necho {COMPLETION_SENTINEL}\n```",
-    ])
-
-    config = load_config()
-    model = Model(model_name="dummy", api_base="http://unused", api_key="EMPTY")
-    monkeypatch.setattr(model, "query", lambda messages: next(responses))
-
+def test_loop_runs_tools_and_completes_on_a_text_reply(tmp_path):
     agent = Agent(
-        model=model,
+        model=ScriptedModel(
+            assistant(""),  # nothing said and nothing called: keeps going
+            assistant("Creating the file.",
+                      tool_calls=[tool_call(1, command="echo hi > out.txt")]),
+            assistant("Created out.txt with the text hi."),
+        ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
-        templates=config["templates"],
-        step_limit=40,
+        templates=load_config()["templates"],
+        step_limit=5,
     )
-    result = agent.run("create out.txt containing hi, then finish")
+
+    result = agent.run("create out.txt")
 
     assert result["completed"] is True
     assert result["n_steps"] == 3
-    assert (tmp_path / "out.txt").read_text().strip() == "hi"
+    assert result["final_output"] == "Created out.txt with the text hi."
+    assert (tmp_path / "out.txt").read_text() == "hi\n"
 
-    # Step 1: no bash block -> reminder observation, no command.
-    assert result["steps"][0]["command"] is None
-    assert "No bash code block" in result["steps"][0]["observation"]
-    # Step 2: the command was parsed and executed (exit code 0).
+    assert result["steps"][0]["note"] == "empty response"
     assert result["steps"][1]["command"] == "echo hi > out.txt"
     assert result["steps"][1]["returncode"] == 0
-    # Step 3: completion sentinel command terminated the loop.
-    assert COMPLETION_SENTINEL in result["steps"][2]["command"]
+
+    roles = [message["role"] for message in agent.messages]
+    assert roles == [
+        "system", "user",        # prompt
+        "assistant", "user",     # empty reply, then the reminder
+        "assistant", "tool",     # the bash call and its result
+        "assistant",             # the final answer
+    ]

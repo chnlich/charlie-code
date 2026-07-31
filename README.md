@@ -56,14 +56,28 @@ followed by a summary line with step count and token usage.
 
 ### How a run ends
 
-- **Completion sentinel.** When the task is solved the model emits a final command
-  `echo CHARLIE_CODE_COMPLETE`; the loop detects the sentinel and stops successfully.
-  This marker is documented in the system template in `src/config/default.yaml`.
-- **Step limit.** If the sentinel is never emitted, the loop raises after `--steps`
-  steps (default 40) — it fails loud rather than silently stopping.
-- **No bash block.** If the model's reply contains no bash block, a short
-  format-reminder observation is appended and the loop continues (it does not crash).
-- **Multiple bash blocks.** Only the first is executed; the observation notes this.
+The agent drives the endpoint's native tool calling: it offers exactly one tool,
+`bash`, and reads the response envelope rather than parsing the model's prose.
+
+- **Completion is a whitelist.** The run ends only when a reply satisfies all three:
+  `finish_reason` is `stop`, it carries no tool calls, and its text is non-empty.
+  That text is the final answer. Any other combination continues or fails.
+- **Tool calls.** A reply carrying tool calls runs all of them in the order given,
+  one tool result fed back per call, then the loop continues.
+- **Truncation.** `finish_reason: length` raises immediately. A reply cut off
+  mid-answer is shape-identical to a finished one, so only the envelope can tell
+  them apart, and guessing would silently accept a half-finished answer.
+- **Empty reply.** No tool call and no text ends nothing; a short reminder is
+  appended and the loop continues.
+- **Step limit.** The loop raises after `--steps` steps (default 40) — it fails loud
+  rather than silently stopping.
+- **Withheld output.** Command output containing a model's own structure markers is
+  not fed back. The serving stack parses generated text back into tool calls, so a
+  marker that reaches the transcript can be echoed by the model and promoted from
+  data into a real, executed call. The exit code still comes through, and the agent
+  is told to re-read the content through a transform such as `base64`.
+- **Resuming.** Session files are stamped with the protocol they were recorded under;
+  a session from the older bash-block protocol is refused rather than replayed.
 
 There is **no cost-based limit** — the SGLang model has no litellm pricing, so the only
 budget is the step count.

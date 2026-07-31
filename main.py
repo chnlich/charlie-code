@@ -120,6 +120,7 @@ def run(
             "type": "result",
             "completed": result["completed"],
             "n_steps": result["n_steps"],
+            "final_output": result["final_output"],
             "usage": result["usage"],
         })
         return

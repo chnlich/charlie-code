@@ -5,7 +5,8 @@ import typer
 from typer.testing import CliRunner
 
 import main as cli_main
-from agent import COMPLETION_SENTINEL, Agent, load_config
+from agent import Agent, load_config
+from conftest import ScriptedModel, assistant, tool_call
 from environment import Environment
 from model import Model
 
@@ -23,7 +24,7 @@ def _json_lines(output):
 def _patch_model(monkeypatch, *responses, usage=None):
     replies = iter(responses)
 
-    def query(self, messages):
+    def query(self, messages, tools=None):
         return next(replies)
 
     monkeypatch.setattr(Model, "query", query)
@@ -34,21 +35,11 @@ def _patch_model(monkeypatch, *responses, usage=None):
     )
 
 
-class _ScriptedModel:
-    def __init__(self, *responses):
-        self._responses = iter(responses)
-
-    def query(self, messages):
-        return next(self._responses)
-
-    def usage(self):
-        return {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
-
-
 def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
     _patch_model(
         monkeypatch,
-        f"Writing file.\n```bash\nprintf hi > out.txt && echo {COMPLETION_SENTINEL}\n```",
+        assistant("Writing file.", tool_calls=[tool_call(1, command="printf hi > out.txt")]),
+        assistant("Wrote out.txt."),
     )
 
     result = CliRunner().invoke(
@@ -72,20 +63,24 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
         "thought",
         "command",
         "observation",
+        "thought",
         "result",
     ]
     assert set(events[0]) == {"type", "session_id"}
-    assert events[2]["id"] == events[3]["id"] == "s-1"
-    assert events[2]["command"].startswith("printf hi > out.txt")
+    assert events[2]["id"] == events[3]["id"]
+    assert events[2]["command"] == "printf hi > out.txt"
     assert events[3]["returncode"] == 0
-    assert COMPLETION_SENTINEL in events[3]["output"]
     assert events[-1]["completed"] is True
+    assert events[-1]["final_output"] == "Wrote out.txt."
     assert events[-1]["usage"] == {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
     assert (tmp_path / "out.txt").read_text() == "hi"
 
 
 def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
-    _patch_model(monkeypatch, "Still working.\n```bash\necho not_done\n```")
+    _patch_model(
+        monkeypatch,
+        assistant("Still working.", tool_calls=[tool_call(1, command="echo not_done")]),
+    )
 
     result = CliRunner().invoke(
         _cli_app(),
@@ -109,7 +104,7 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
 
 
 def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
-    def query(self, messages):
+    def query(self, messages, tools=None):
         raise ValueError("model exploded")
 
     monkeypatch.setattr(Model, "query", query)
@@ -139,9 +134,11 @@ def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch
 def test_agent_emit_collects_per_step_events(tmp_path):
     events = []
     agent = Agent(
-        model=_ScriptedModel(
-            "Thinking without a command.",
-            f"Writing file.\n```bash\nprintf hi > out.txt && echo {COMPLETION_SENTINEL}\n```",
+        model=ScriptedModel(
+            assistant(""),
+            assistant("Writing file.",
+                      tool_calls=[tool_call(1, command="printf hi > out.txt")]),
+            assistant("Wrote out.txt."),
         ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
@@ -154,25 +151,20 @@ def test_agent_emit_collects_per_step_events(tmp_path):
     assert result["completed"] is True
     assert [event["type"] for event in events] == [
         "thought",
-        "thought",
         "command",
         "observation",
+        "thought",
     ]
-    assert events[0] == {
-        "type": "thought",
-        "step": 1,
-        "text": "Thinking without a command.",
-    }
-    assert events[2]["step"] == events[3]["step"] == 2
-    assert events[2]["id"] == events[3]["id"] == "s-2"
-    assert events[3]["returncode"] == 0
-    assert COMPLETION_SENTINEL in events[3]["output"]
+    assert events[0] == {"type": "thought", "step": 2, "text": "Writing file."}
+    assert events[1]["step"] == events[2]["step"] == 2
+    assert events[1]["id"] == events[2]["id"]
+    assert events[2]["returncode"] == 0
     assert (tmp_path / "out.txt").read_text() == "hi"
 
 
 def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     success = Agent(
-        model=_ScriptedModel(f"```bash\necho {COMPLETION_SENTINEL}\n```"),
+        model=ScriptedModel(assistant("Nothing to do.")),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
         step_limit=1,
@@ -184,7 +176,10 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     assert success["usage"] == {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
 
     agent = Agent(
-        model=_ScriptedModel("No completion.\n```bash\necho not_done\n```"),
+        model=ScriptedModel(
+            assistant("No completion.",
+                      tool_calls=[tool_call(1, command="echo not_done")]),
+        ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
         step_limit=1,

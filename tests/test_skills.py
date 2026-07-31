@@ -1,6 +1,6 @@
 """Tests for Agent Skills catalog loading and prompt injection."""
 
-from agent import COMPLETION_SENTINEL, load_config, render
+from agent import load_config, render
 from skills import load_skill_catalog
 
 
@@ -61,7 +61,6 @@ def test_system_template_injects_non_empty_catalog():
     prompt = render(
         config["templates"]["system"],
         cwd="/repo",
-        completion_sentinel=COMPLETION_SENTINEL,
         skills=catalog,
     )
 
@@ -74,7 +73,6 @@ def test_system_template_has_no_skills_header_when_catalog_empty():
     prompt = render(
         config["templates"]["system"],
         cwd="/repo",
-        completion_sentinel=COMPLETION_SENTINEL,
         skills="",
     )
 
