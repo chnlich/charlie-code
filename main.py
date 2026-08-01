@@ -17,6 +17,10 @@ from model import Model
 from skills import load_skill_catalog
 
 
+def _print_log_retention(environment):
+    print(f"Command logs retained at: {environment.log_dir}", file=sys.stderr)
+
+
 def _print_trajectory(result):
     for idx, step in enumerate(result["steps"], start=1):
         print(f"\n{'─' * 24} step {idx} {'─' * 24}")
@@ -53,6 +57,9 @@ def run(
         None, "--session-dir", help="Session state directory override."
     ),
     steps: int = typer.Option(None, "--steps", help="Hard step limit override."),
+    wall_seconds: int = typer.Option(
+        None, "--wall-seconds", help="Hard episode wall-clock budget override, in seconds."
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -92,12 +99,19 @@ def run(
     session_id = resume or str(uuid.uuid4())
     state_file = os.path.join(resolved_session_dir, f"{session_id}.json")
     step_limit = steps if steps is not None else config["agent"]["step_limit"]
+    wall_budget = wall_seconds if wall_seconds is not None else config["agent"]["wall_seconds"]
 
     agent = Agent(
-        model=Model(model_name=model_name, api_base=base_url, api_key=api_key),
+        model=Model(
+            model_name=model_name,
+            api_base=base_url,
+            api_key=api_key,
+            model_timeout=config["model"]["model_timeout"],
+        ),
         environment=Environment(cwd=working_dir, timeout=config["environment"]["timeout"]),
         templates=config["templates"],
         step_limit=step_limit,
+        wall_seconds=wall_budget,
         skills_catalog=load_skill_catalog(resolved_skills_root),
         emit=_emit,
         state_file=state_file,
@@ -109,13 +123,20 @@ def run(
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 result = agent.run(task)
+        except KeyboardInterrupt:
+            agent.environment.sweep()
+            _print_log_retention(agent.environment)
+            raise
         except RuntimeError as exc:
             _emit({"type": "error", "message": str(exc)})
+            _print_log_retention(agent.environment)
             raise typer.Exit(1) from None
         except Exception as exc:
             _emit({"type": "error", "message": str(exc)})
+            _print_log_retention(agent.environment)
             raise typer.Exit(1) from None
 
+        agent.environment.cleanup_log_dir()
         _emit({
             "type": "result",
             "completed": result["completed"],
@@ -125,7 +146,18 @@ def run(
         })
         return
 
-    result = agent.run(task)
+    try:
+        result = agent.run(task)
+    except KeyboardInterrupt:
+        agent.environment.sweep()
+        _print_log_retention(agent.environment)
+        raise
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        _print_log_retention(agent.environment)
+        raise typer.Exit(1) from None
+
+    agent.environment.cleanup_log_dir()
     _print_trajectory(result)
 
 

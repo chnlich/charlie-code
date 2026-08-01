@@ -1,8 +1,18 @@
 """Shared helpers for the tool-calling protocol tests."""
 
 import json
+import sys
+from pathlib import Path
 
 import pytest
+
+# Prefer this checkout's own src/ and repo root over whatever an editable install's
+# .pth file happens to point at (it may resolve to a different checkout of the same
+# repo), so `python -m pytest` always exercises the code actually under test here.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT / "src"), str(_REPO_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 _UNSET = object()
 

@@ -35,22 +35,30 @@ def as_message_dict(message):
 
 
 class Model:
-    def __init__(self, model_name, api_base, api_key):
+    def __init__(self, model_name, api_base, api_key, model_timeout):
         self.model_name = model_name
         self.api_base = api_base
         self.api_key = api_key
+        self.model_timeout = model_timeout
         self.n_calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
 
     def query(self, messages, tools=None):
-        """Send the conversation and return (assistant message, finish_reason)."""
+        """Send the conversation and return (assistant message, finish_reason).
+
+        `num_retries=0` is explicit: litellm's OpenAI-compatible handler otherwise
+        retries internally (default `max_retries=2`), which would silently triple
+        the worst-case cost of a stalled call on top of `timeout`.
+        """
         response = litellm.completion(
             model=self.model_name,
             messages=messages,
             tools=tools,
             api_base=self.api_base,
             api_key=self.api_key,
+            timeout=self.model_timeout,
+            num_retries=0,
             extra_body={"separate_reasoning": True},
         )
         self.n_calls += 1

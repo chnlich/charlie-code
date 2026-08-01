@@ -5,9 +5,11 @@
 model:
   model_name: "openai/your-org/your-model"
   api_base: "https://YOUR_SGLANG_HOST/v1"
+  model_timeout: 300
 
 agent:
   step_limit: 40
+  wall_seconds: 3600
 
 environment:
   timeout: 60
@@ -35,6 +37,15 @@ templates:
       state, and prefer absolute paths.
     - Your working directory is: {{cwd}}
     - Work autonomously until the task is solved. Do not ask the user questions.
+
+    Long-running commands:
+    - A command still running past ~60s is auto-backgrounded, not killed: you get
+      back its pid, the absolute path of its still-growing log file, and its output
+      so far. Polling it, doing other work and checking back later, and killing it
+      yourself with plain bash (`tail`, `kill -0`, `kill`) are all equally fine.
+    - Background work that must keep running after its own command returns needs its
+      own session: start it as `setsid nohup cmd > log 2>&1 & echo $!`, otherwise it
+      is cleaned up together with the command that started it.
 
     {{skills}}
 

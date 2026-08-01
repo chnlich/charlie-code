@@ -10,6 +10,7 @@ completion, because a truncated reply looks exactly like a finished one.
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
@@ -121,6 +122,7 @@ class Agent:
         environment,
         templates,
         step_limit,
+        wall_seconds=3600,
         skills_catalog="",
         emit=None,
         state_file=None,
@@ -130,11 +132,28 @@ class Agent:
         self.environment = environment
         self.templates = templates
         self.step_limit = step_limit
+        self.wall_seconds = wall_seconds
         self.skills_catalog = skills_catalog
         self.emit = emit
         self.state_file = state_file
         self.resume = resume
         self.messages = []
+        self._start_time = None
+
+    def _check_wall(self):
+        """Raise once elapsed run time exceeds the wall-clock budget.
+
+        Called at step top, right after `model.query` returns, and after each
+        single tool call inside `_run_tool_calls` -- a reply may carry several
+        calls, so the budget must also be enforced between them, not only at step
+        boundaries.
+        """
+        elapsed = time.monotonic() - self._start_time
+        if elapsed > self.wall_seconds:
+            raise RuntimeError(
+                f"Wall-clock budget ({self.wall_seconds}s) exceeded after "
+                f"{elapsed:.1f}s."
+            )
 
     def _initial_messages(self, task):
         if self.resume and self.state_file and Path(self.state_file).exists():
@@ -184,6 +203,7 @@ class Agent:
                                       "content": error})
                 records.append({"thought": step_thought, "command": None,
                                 "observation": error, "note": "invalid tool call"})
+                self._check_wall()
                 continue
 
             event_id = f"s-{step_idx}-{index}"
@@ -211,15 +231,19 @@ class Agent:
             records.append({"thought": step_thought, "command": command,
                             "observation": observation,
                             "returncode": result["returncode"], "note": note})
+            self._check_wall()
         return records
 
     def run(self, task):
         self.messages = self._initial_messages(task)
+        self._start_time = time.monotonic()
         steps = []
         try:
             for step_idx in range(1, self.step_limit + 1):
+                self._check_wall()
                 message, finish_reason = self.model.query(self.messages, tools=[BASH_TOOL])
                 self.messages.append(message)
+                self._check_wall()
                 thought = strip_leaked_reasoning(message.get("content") or "").strip()
                 if self.emit and thought:
                     self.emit({"type": "thought", "step": step_idx, "text": thought})
@@ -255,3 +279,4 @@ class Agent:
             )
         finally:
             self._persist_messages()
+            self.environment.sweep()
