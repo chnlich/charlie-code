@@ -44,6 +44,8 @@ class ScriptedModel:
     def __init__(self, *replies):
         self._replies = iter(replies)
         self.seen_tools = []
+        # Zero tokens: the compaction trigger never fires in these tests.
+        self.last_prompt_tokens = 0
 
     def query(self, messages, tools=None):
         self.seen_tools.append(tools)

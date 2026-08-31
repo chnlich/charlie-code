@@ -116,6 +116,7 @@ def run(
         emit=_emit,
         state_file=state_file,
         resume=resume is not None,
+        compact=config["compact"],
     )
 
     if json_output:

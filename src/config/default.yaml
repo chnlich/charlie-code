@@ -11,6 +11,25 @@ agent:
   step_limit: 40
   wall_seconds: 3600
 
+# Layered context compaction. Every observation entering history is bounded by the
+# per-step entry budget; at a step boundary whose measured prompt tokens (plus a
+# chars/4 estimate of what was appended since) reach threshold_fraction *
+# context_window, old tool observations are masked with re-readable placeholders,
+# and if that is still not enough the history is rebuilt as [system, task,
+# summary, verbatim tail]. An over-window error from the endpoint runs the same
+# compaction and retries the call once.
+#
+# Config invariant: mask_keep_steps x the per-step entry budget plus
+# tail_budget_tokens plus fixed overhead (system + task + summary) must leave
+# headroom under context_window. Defaults: 8 x ~10k tokens + 24k tail + ~1.2k
+# overhead ~= 105k tokens against a 131072 window (~26k headroom).
+compact:
+  context_window: 131072
+  threshold_fraction: 0.65
+  mask_keep_steps: 8
+  tail_budget_tokens: 24000
+  step_observation_budget_chars: 40000
+
 environment:
   timeout: 60
 
@@ -68,3 +87,30 @@ templates:
   empty_response_reminder: |
     Your last reply contained neither a tool call nor any text. Either call the `bash`
     tool with the next command, or reply with your final answer as plain text.
+
+  compact_prompt: |
+    You are compacting the conversation of an autonomous software engineering
+    agent (your own session) to fit the model context window. The conversation
+    above is the full session so far. After compaction, the most recent messages
+    remain available verbatim, so do NOT restate their detail; summarize what is
+    not in them. If the conversation already contains an earlier summary, inherit
+    every fact in it that is still valid.
+
+    Write a structured handoff summary with exactly these five sections:
+    1. Progress and decisions: what has been accomplished and which decisions
+       were made, including the reasons behind non-obvious ones.
+    2. Unresolved issues: problems still open, with what is known about each.
+    3. Attempted and failed paths: approaches already tried that did not work,
+       so they are not retried.
+    4. Key paths and commands: file paths, commands, and other concrete handles
+       the remaining work depends on.
+    5. Remaining steps: what still has to happen to complete the task.
+
+    Be terse and factual. Reply with the summary only, as plain text.
+
+  compact_summary_prefix: |
+    Another model has summarized the session so far to fit the context window.
+    Its summary follows; the messages after it are the most recent steps, kept
+    verbatim.
+
+    Summary of the session so far:

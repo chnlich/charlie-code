@@ -43,6 +43,8 @@ class Model:
         self.n_calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        # prompt_tokens of the most recent call; the compaction trigger's anchor.
+        self.last_prompt_tokens = None
 
     def query(self, messages, tools=None):
         """Send the conversation and return (assistant message, finish_reason).
@@ -65,6 +67,7 @@ class Model:
         usage = response.usage
         self.input_tokens += usage.prompt_tokens
         self.output_tokens += usage.completion_tokens
+        self.last_prompt_tokens = usage.prompt_tokens
         choice = response.choices[0]
         return as_message_dict(choice.message), choice.finish_reason
 

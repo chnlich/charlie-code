@@ -5,16 +5,33 @@ assistant message; when it carries tool calls we run them and feed one tool mess
 back per call. When it carries none, the envelope's `finish_reason` decides: only
 `stop` with non-empty text ends the session. The message shape alone never proves
 completion, because a truncated reply looks exactly like a finished one.
+
+To keep long sessions alive near the context window, the loop compacts history in
+layers (see compact.py): a per-step entry budget bounds every step's observations
+before they enter history; at a step boundary whose measured-plus-estimated size
+reaches the threshold, old observations are masked (lossless: re-run to re-read),
+and when that is not enough a structured summary plus a verbatim tail replaces the
+history. An over-window error from the endpoint runs the same compaction and
+retries the call once instead of killing the session.
 """
 
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 import yaml
+from litellm.exceptions import ContextWindowExceededError
 
+from compact import (
+    bound_observation,
+    drop_oldest_middle_half,
+    est_messages_tokens,
+    mask_old_observations,
+    verbatim_tail_span,
+)
 from model import strip_leaked_reasoning
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
@@ -127,6 +144,7 @@ class Agent:
         emit=None,
         state_file=None,
         resume=False,
+        compact=None,
     ):
         self.model = model
         self.environment = environment
@@ -137,8 +155,13 @@ class Agent:
         self.emit = emit
         self.state_file = state_file
         self.resume = resume
+        self.compact = compact if compact is not None else load_config()["compact"]
         self.messages = []
         self._start_time = None
+        # len(self.messages) at the last successful model query: messages after it
+        # are what the last measured prompt_tokens does not yet account for. None
+        # right after a compaction, until the next query re-anchors the estimate.
+        self._last_query_index = None
 
     def _check_wall(self):
         """Raise once elapsed run time exceeds the wall-clock budget.
@@ -192,17 +215,25 @@ class Agent:
         os.replace(tmp_path, state_path)
 
     def _run_tool_calls(self, step_idx, thought, tool_calls):
-        """Run every call in order, appending one tool message per call."""
+        """Run every call in order, appending one tool message per call.
+
+        Every observation passes the control-marker gate on its complete output
+        first, then the step's cumulative entry budget: bounding decides what
+        enters history, never whether the command runs.
+        """
         records = []
+        remaining = self.compact["step_observation_budget_chars"]
         for index, tool_call in enumerate(tool_calls, start=1):
             step_thought = thought if index == 1 else ""
             command, error = tool_call_command(tool_call)
             if error is not None:
+                bounded, charged = bound_observation(error, remaining)
+                remaining -= charged
                 self.messages.append({"role": "tool",
                                       "tool_call_id": tool_call.get("id"),
-                                      "content": error})
+                                      "content": bounded})
                 records.append({"thought": step_thought, "command": None,
-                                "observation": error, "note": "invalid tool call"})
+                                "observation": bounded, "note": "invalid tool call"})
                 self._check_wall()
                 continue
 
@@ -225,14 +256,150 @@ class Agent:
             )
             if note:
                 observation = f"[{note}]\n{observation}"
+            bounded, charged = bound_observation(observation, remaining)
+            remaining -= charged
             self.messages.append({"role": "tool",
                                   "tool_call_id": tool_call.get("id"),
-                                  "content": observation})
+                                  "content": bounded})
             records.append({"thought": step_thought, "command": command,
-                            "observation": observation,
+                            "observation": bounded,
                             "returncode": result["returncode"], "note": note})
             self._check_wall()
         return records
+
+    def _threshold_tokens(self):
+        return int(self.compact["threshold_fraction"] * self.compact["context_window"])
+
+    def _anchored_estimate(self):
+        """prompt_tokens measured by the last call plus chars/4 of what was
+        appended since. The measured value is the anchor; the chars/4 part only
+        spans messages the measurement does not know about. None without anchor."""
+        measured = self.model.last_prompt_tokens
+        if measured is None or self._last_query_index is None:
+            return None
+        return measured + est_messages_tokens(self.messages[self._last_query_index:])
+
+    def _query_step(self, step_idx):
+        """One model call with the over-window fallback.
+
+        An over-window error runs one compaction and the call is retried once; a
+        second over-window failure raises. Any other error propagates unchanged.
+        """
+        self._last_query_index = len(self.messages)
+        try:
+            return self.model.query(self.messages, tools=[BASH_TOOL])
+        except ContextWindowExceededError:
+            self._compact(step_idx, trigger="overflow")
+        self._last_query_index = len(self.messages)
+        try:
+            return self.model.query(self.messages, tools=[BASH_TOOL])
+        except ContextWindowExceededError as exc:
+            raise RuntimeError(
+                f"Step {step_idx}: context window still exceeded after one "
+                f"compaction and retry; giving up."
+            ) from exc
+
+    def _maybe_compact(self, step_idx):
+        """Threshold trigger, checked at step boundaries."""
+        estimate = self._anchored_estimate()
+        if estimate is None or estimate < self._threshold_tokens():
+            return
+        self._compact(step_idx, trigger="threshold", pre_tokens=estimate)
+
+    def _compact(self, step_idx, trigger, pre_tokens=None):
+        """One compaction pass: mask layer, summarize layer when masking is not
+        enough (or the endpoint already reported overflow), then persist and
+        emit. Compaction rewrites self.messages in place; the state protocol is
+        untouched."""
+        if pre_tokens is None:
+            estimate = self._anchored_estimate()
+            pre_tokens = (estimate if estimate is not None
+                          else est_messages_tokens(self.messages))
+
+        mask_old_observations(self.messages, self.compact["mask_keep_steps"])
+        layer = "mask"
+        if (trigger == "overflow"
+                or est_messages_tokens(self.messages) >= self._threshold_tokens()):
+            self._summarize_layer(step_idx)
+            layer = "summarize"
+
+        self._persist_messages()
+        self._last_query_index = None
+        event = {
+            "type": "compact",
+            "step": step_idx,
+            "layer": layer,
+            "trigger": trigger,
+            "pre_tokens": int(pre_tokens),
+            "post_tokens_est": est_messages_tokens(self.messages),
+        }
+        if self.emit:
+            self.emit(event)
+        else:
+            print(
+                f"[compact] step {step_idx} layer={layer} trigger={trigger} "
+                f"pre_tokens={event['pre_tokens']} "
+                f"post_tokens_est={event['post_tokens_est']}",
+                file=sys.stderr,
+            )
+
+    def _summarize_layer(self, step_idx):
+        """Rebuild history as [system, task, summary, verbatim tail]."""
+        summary = self._summary_text(step_idx)
+        tail_start, tail_end = verbatim_tail_span(
+            self.messages, self.compact["tail_budget_tokens"]
+        )
+        prefix = self.templates["compact_summary_prefix"].rstrip("\n") + "\n\n"
+        self.messages = (
+            self.messages[:2]
+            + [{"role": "user", "content": prefix + summary}]
+            + self.messages[tail_start:tail_end]
+        )
+
+    def _summary_text(self, step_idx):
+        """One same-model, tool-less summary call over the masked full history.
+
+        Summary output passes the control-marker gate: markers mean one retry,
+        then refusal. An over-window summary call drops the oldest half of the
+        maskable middle and retries once.
+        """
+        dropped = False
+        marked = False
+        while True:
+            prompt = self.messages + [
+                {"role": "user", "content": self.templates["compact_prompt"]}
+            ]
+            try:
+                message, finish_reason = self.model.query(prompt, tools=None)
+            except ContextWindowExceededError:
+                if dropped:
+                    raise RuntimeError(
+                        f"Step {step_idx}: compaction summary still exceeds the "
+                        f"context window after dropping the oldest half of the "
+                        f"maskable middle."
+                    )
+                tail_start, _ = verbatim_tail_span(
+                    self.messages, self.compact["tail_budget_tokens"]
+                )
+                drop_oldest_middle_half(self.messages, tail_start)
+                dropped = True
+                continue
+            if finish_reason == "length":
+                raise RuntimeError(
+                    f"Step {step_idx}: compaction summary was truncated "
+                    f"(finish_reason=length); raise the endpoint's output budget."
+                )
+            text = strip_leaked_reasoning(message.get("content") or "").strip()
+            if find_control_markers(text):
+                if marked:
+                    raise RuntimeError(
+                        f"Step {step_idx}: compaction summary contains model "
+                        f"control markers after a retry; refusing to rebuild "
+                        f"history on top of it."
+                    )
+                marked = True
+                continue
+            return text
 
     def run(self, task):
         self.messages = self._initial_messages(task)
@@ -241,7 +408,8 @@ class Agent:
         try:
             for step_idx in range(1, self.step_limit + 1):
                 self._check_wall()
-                message, finish_reason = self.model.query(self.messages, tools=[BASH_TOOL])
+                self._maybe_compact(step_idx)
+                message, finish_reason = self._query_step(step_idx)
                 self.messages.append(message)
                 self._check_wall()
                 thought = strip_leaked_reasoning(message.get("content") or "").strip()
