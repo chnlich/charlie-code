@@ -132,3 +132,85 @@ def test_run_episode_argv_uses_resolved_interpreter(tmp_path, monkeypatch):
     run.run_episode(task, model_cfg, tmp_path, 60, fake_interp)
     assert captured["argv"][0] == fake_interp
     assert captured["argv"][1:4] == ["-m", "main", "--json"]
+
+
+def _capture_episode(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            stdout='{"type": "result", "completed": true, "n_steps": 0, "usage": {}}',
+            returncode=0,
+        )
+
+    monkeypatch.setattr(run.subprocess, "run", fake_run)
+    return captured
+
+
+def test_run_episode_delivers_the_prompt_over_stdin_never_argv(tmp_path, monkeypatch):
+    captured = _capture_episode(monkeypatch)
+    prompt = "solve it, quoting 'single' and $shell $(metachars) freely"
+    task = {"id": "t", "prompt": prompt, "step_limit": 1}
+    model_cfg = {"model_name": "m", "api_base": "http://h/v1", "api_key": "EMPTY"}
+    run.run_episode(task, model_cfg, tmp_path, 60, run.sys.executable)
+    argv = captured["argv"]
+    assert argv[-2:] == ["--task-file", "-"]
+    assert captured["kwargs"]["input"] == prompt
+    assert prompt not in argv
+    assert all("solve it" not in element and "$(metachars)" not in element
+               for element in argv)
+
+
+def test_run_episode_appends_context_window_iff_model_cfg_carries_one(
+    tmp_path, monkeypatch
+):
+    captured = _capture_episode(monkeypatch)
+    task = {"id": "t", "prompt": "p", "step_limit": 1}
+
+    with_window = {"model_name": "m", "api_base": "http://h/v1",
+                   "api_key": "EMPTY", "context_window": 262144}
+    run.run_episode(task, with_window, tmp_path, 60, run.sys.executable)
+    argv = captured["argv"]
+    index = argv.index("--context-window")
+    assert argv[index + 1] == "262144"
+
+    without_window = {"model_name": "m", "api_base": "http://h/v1", "api_key": "EMPTY"}
+    run.run_episode(task, without_window, tmp_path, 60, run.sys.executable)
+    assert "--context-window" not in captured["argv"]
+
+
+def _window_cfg():
+    cfg = _models_cfg()
+    cfg["models"]["kimi-k3"]["window_env"] = "CC_EVAL_KIMI_K3_WINDOW"
+    return cfg
+
+
+_KIMI_ENV = {"CC_EVAL_KIMI_K3_MODEL": "kimi", "CC_EVAL_KIMI_K3_BASE": "http://k/v1"}
+
+
+def test_resolve_model_window_env_set_parses_into_model_cfg(tmp_path):
+    env = dict(_KIMI_ENV, CC_EVAL_KIMI_K3_WINDOW="524288")
+    resolved = run.resolve_model(
+        _window_cfg(), "kimi-k3", env_file=tmp_path / "absent.env", env=env,
+    )
+    assert resolved["context_window"] == 524288
+
+
+def test_resolve_model_window_env_unset_or_field_absent_passes_nothing(tmp_path):
+    missing = tmp_path / "absent.env"
+    # Field defined but environment unset.
+    resolved = run.resolve_model(_window_cfg(), "kimi-k3", env_file=missing, env=_KIMI_ENV)
+    assert "context_window" not in resolved
+    # Field absent entirely, even with the variable set.
+    env = dict(_KIMI_ENV, CC_EVAL_KIMI_K3_WINDOW="524288")
+    resolved = run.resolve_model(_models_cfg(), "kimi-k3", env_file=missing, env=env)
+    assert "context_window" not in resolved
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "0", "-3"])
+def test_resolve_model_window_env_invalid_fails_naming_the_variable(tmp_path, bad):
+    env = dict(_KIMI_ENV, CC_EVAL_KIMI_K3_WINDOW=bad)
+    with pytest.raises(SystemExit, match="CC_EVAL_KIMI_K3_WINDOW"):
+        run.resolve_model(_window_cfg(), "kimi-k3", env_file=tmp_path / "absent.env", env=env)

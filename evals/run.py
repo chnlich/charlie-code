@@ -104,12 +104,33 @@ def resolve_model(models_cfg, logical_id, env_file=DEFAULT_ENV_FILE, env=None):
     env = dict(env if env is not None else os.environ)
     file_values = _read_env_file(env_file)
     api_key = env.get(api_key_env) or file_values.get(api_key_env) or api_key_default
-    return {
+    model_cfg = {
         "model_id": logical_id,
         "model_name": resolved[entry["model_env"]],
         "api_base": resolved[entry["base_env"]],
         "api_key": api_key,
     }
+    # Optional per-model compaction window override: an env var NAME from the
+    # registry (never a value). Set -> parsed int >= 1; unset -> the flag is
+    # not passed and charlie-code's packaged default applies.
+    window_env = entry.get("window_env")
+    if window_env:
+        raw_window = env.get(window_env) or file_values.get(window_env)
+        if raw_window:
+            try:
+                window = int(raw_window)
+            except ValueError:
+                raise SystemExit(
+                    f"invalid value for {window_env}: {raw_window!r} "
+                    f"(expected an integer >= 1)"
+                ) from None
+            if window < 1:
+                raise SystemExit(
+                    f"invalid value for {window_env}: {raw_window!r} "
+                    f"(expected an integer >= 1)"
+                )
+            model_cfg["context_window"] = window
+    return model_cfg
 
 
 def resolve_episode_interpreter(env_file=DEFAULT_ENV_FILE, env=None):
@@ -229,8 +250,12 @@ def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter):
         "--api-base", model_cfg["api_base"],
         "--steps", str(task["step_limit"]),
         "--session-dir", str(session_dir),
-        task["prompt"],
     ]
+    if model_cfg.get("context_window") is not None:
+        argv += ["--context-window", str(model_cfg["context_window"])]
+    # The prompt rides stdin, never argv: an argv element caps at 128 KiB
+    # (MAX_ARG_STRLEN) and is world-readable via /proc/<pid>/cmdline.
+    argv += ["--task-file", "-"]
     child_env = dict(os.environ)
     child_env["CHARLIE_CODE_API_KEY"] = model_cfg["api_key"]
     child_env["LITELLM_LOG"] = "ERROR"
@@ -246,7 +271,7 @@ def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter):
     start = time.perf_counter()
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True,
+            argv, input=task["prompt"], capture_output=True, text=True,
             timeout=episode_timeout, env=child_env,
         )
         wall_s = time.perf_counter() - start
