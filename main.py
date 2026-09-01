@@ -21,20 +21,17 @@ from skills import load_skill_catalog
 def _read_task(task_file):
     """The task text from --task-file, verbatim.
 
-    PATH of '-' reads sys.stdin. Decoding is strict UTF-8 (no errors="replace":
-    the task is an explicit user choice, so a bad byte stops the run), and
-    empty-after-strip content is an error. Failure always names the flag.
+    Decoding is strict UTF-8 (no errors="replace": the task is an explicit
+    user choice, so a bad byte stops the run), and empty-after-strip content
+    is an error. Failure always names the flag.
     """
-    source = "stdin" if task_file == "-" else repr(task_file)
-    if task_file == "-":
-        raw = sys.stdin.buffer.read()
-    else:
-        try:
-            raw = Path(task_file).read_bytes()
-        except OSError as exc:
-            raise typer.BadParameter(
-                f"--task-file: cannot read {task_file!r}: {exc.strerror or exc}"
-            ) from None
+    source = repr(task_file)
+    try:
+        raw = Path(task_file).read_bytes()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"--task-file: cannot read {task_file!r}: {exc.strerror or exc}"
+        ) from None
     try:
         task = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -73,8 +70,8 @@ def run(
     task_file: str = typer.Option(
         ...,
         "--task-file",
-        help="Read the task text from PATH ('-' reads stdin). The file's full "
-        "UTF-8 text is the task, verbatim; it never rides argv.",
+        help="Read the task text from PATH. The file's full UTF-8 text is "
+        "the task, verbatim; it never rides argv.",
     ),
     model: str = typer.Option(None, "--model", help="litellm model id override."),
     api_base: str = typer.Option(

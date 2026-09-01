@@ -1,5 +1,6 @@
 """Env resolution precedence and missing-variable reporting for evals/run.py."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -128,8 +129,10 @@ def test_run_episode_argv_uses_resolved_interpreter(tmp_path, monkeypatch):
     monkeypatch.setattr(run.subprocess, "run", fake_run)
     task = {"id": "t", "prompt": "do it", "step_limit": 1}
     model_cfg = {"model_name": "m", "api_base": "http://h/v1", "api_key": "EMPTY"}
+    task_file = tmp_path / "task.md"
+    task_file.write_text(task["prompt"], encoding="utf-8")
     fake_interp = str(tmp_path / "episode-python")
-    run.run_episode(task, model_cfg, tmp_path, 60, fake_interp)
+    run.run_episode(task, model_cfg, tmp_path, 60, fake_interp, task_file)
     assert captured["argv"][0] == fake_interp
     assert captured["argv"][1:4] == ["-m", "main", "--json"]
 
@@ -149,18 +152,75 @@ def _capture_episode(monkeypatch):
     return captured
 
 
-def test_run_episode_delivers_the_prompt_over_stdin_never_argv(tmp_path, monkeypatch):
+def test_run_episode_delivers_the_prompt_via_a_task_file_never_argv(
+    tmp_path, monkeypatch
+):
     captured = _capture_episode(monkeypatch)
     prompt = "solve it, quoting 'single' and $shell $(metachars) freely"
     task = {"id": "t", "prompt": prompt, "step_limit": 1}
     model_cfg = {"model_name": "m", "api_base": "http://h/v1", "api_key": "EMPTY"}
-    run.run_episode(task, model_cfg, tmp_path, 60, run.sys.executable)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    task_file = tmp_path / "task.md"  # a sibling of the cwd, mirroring _run_one
+    task_file.write_bytes(prompt.encode("utf-8"))
+
+    run.run_episode(task, model_cfg, work_dir, 60, run.sys.executable, task_file)
+
     argv = captured["argv"]
-    assert argv[-2:] == ["--task-file", "-"]
-    assert captured["kwargs"]["input"] == prompt
+    task_path = Path(argv[argv.index("--task-file") + 1])
+    assert task_path.is_file()
+    assert task_path.read_bytes() == prompt.encode("utf-8")
+    assert not task_path.is_relative_to(work_dir)
     assert prompt not in argv
     assert all("solve it" not in element and "$(metachars)" not in element
                for element in argv)
+    assert "input" not in captured["kwargs"]
+
+
+def test_run_one_keeps_the_task_file_outside_the_cwd_and_cleans_it_up(
+    tmp_path, monkeypatch
+):
+    """The per-episode layout: tmp/work is the agent cwd (fixture + grader),
+    tmp/task.md is the task file; both die with the TemporaryDirectory."""
+    seen = {}
+
+    def fake_episode(task, model_cfg, work_dir, episode_timeout, interpreter, task_file):
+        seen["work_dir"] = Path(work_dir)
+        seen["task_file"] = Path(task_file)
+        seen["body"] = Path(task_file).read_bytes()
+        return "", None, 0.0
+
+    def fake_grader(grade_path, work_dir, timeout_s):
+        seen["grader_cwd"] = Path(work_dir)
+        seen["fixture_seen"] = (Path(work_dir) / "seed.txt").is_file()
+        return 1, "wrong_answer"
+
+    monkeypatch.setattr(run, "run_episode", fake_episode)
+    monkeypatch.setattr(run, "run_grader", fake_grader)
+
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "seed.txt").write_text("seed")
+    prompt = "prompt with 'quotes' and $shell $(metachars)"
+    task = {
+        "id": "t", "prompt": prompt, "fixture": "fixture", "grade": "grade.py",
+        "timeout_s": 1, "step_limit": 1,
+        "_fixture": fixture, "_grade": tmp_path / "grade.py",
+    }
+    traj_dir = tmp_path / "traj"
+    traj_dir.mkdir()
+
+    run._run_one(task, 0, {"model_name": "m"}, tmp_path, traj_dir, run.sys.executable)
+
+    work_dir = seen["work_dir"]
+    task_file = seen["task_file"]
+    assert seen["body"] == prompt.encode("utf-8")
+    assert task_file.parent == work_dir.parent
+    assert not task_file.is_relative_to(work_dir)
+    assert seen["grader_cwd"] == work_dir
+    assert seen["fixture_seen"]
+    assert not task_file.exists()
+    assert not work_dir.exists()
 
 
 def test_run_episode_appends_context_window_iff_model_cfg_carries_one(
@@ -168,16 +228,18 @@ def test_run_episode_appends_context_window_iff_model_cfg_carries_one(
 ):
     captured = _capture_episode(monkeypatch)
     task = {"id": "t", "prompt": "p", "step_limit": 1}
+    task_file = tmp_path / "task.md"
+    task_file.write_text(task["prompt"], encoding="utf-8")
 
     with_window = {"model_name": "m", "api_base": "http://h/v1",
                    "api_key": "EMPTY", "context_window": 262144}
-    run.run_episode(task, with_window, tmp_path, 60, run.sys.executable)
+    run.run_episode(task, with_window, tmp_path, 60, run.sys.executable, task_file)
     argv = captured["argv"]
     index = argv.index("--context-window")
     assert argv[index + 1] == "262144"
 
     without_window = {"model_name": "m", "api_base": "http://h/v1", "api_key": "EMPTY"}
-    run.run_episode(task, without_window, tmp_path, 60, run.sys.executable)
+    run.run_episode(task, without_window, tmp_path, 60, run.sys.executable, task_file)
     assert "--context-window" not in captured["argv"]
 
 

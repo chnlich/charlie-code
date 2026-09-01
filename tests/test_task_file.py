@@ -1,4 +1,4 @@
-"""--task-file is the only task input: a UTF-8 file path, or '-' for stdin.
+"""--task-file is the only task input: a UTF-8 file path, always a real file.
 
 Covers the byte round-trip into the rendered instance template (including task
 text beyond the 128 KiB single-argv-element ceiling), the failure surface,
@@ -6,7 +6,6 @@ and the rejection of any positional argument. All offline: Model.query is
 replaced by a one-reply fake that records its prompts.
 """
 
-import pytest
 import typer
 from typer.testing import CliRunner
 
@@ -84,19 +83,11 @@ def test_task_file_content_arrives_byte_identical_in_the_instance_template(
     assert user_message["content"] == _expected_instance_content(task_text)
 
 
-def test_task_file_dash_reads_stdin_identically_to_the_file_branch(
-    tmp_path, monkeypatch
-):
-    seen = _capture_model(monkeypatch)
-    task_text = _big_task()
-
-    result = _invoke(CliRunner(), tmp_path, "-", input=task_text)
-
-    assert result.exit_code == 0, result.output
-    user_message = seen[0][1]
-    assert user_message["role"] == "user"
-    assert task_text in user_message["content"]
-    assert user_message["content"] == _expected_instance_content(task_text)
+def test_task_file_dash_is_an_ordinary_path_and_fails_to_read(tmp_path):
+    """'-' has no special meaning: it hits the ordinary cannot-read error."""
+    result = _invoke(CliRunner(), tmp_path, "-")
+    assert result.exit_code != 0
+    assert "--task-file: cannot read '-'" in result.stderr
 
 
 def test_missing_task_file_flag_is_rejected_naming_the_flag(tmp_path):
@@ -123,14 +114,10 @@ def test_task_file_whitespace_only_content_is_rejected_naming_the_flag(tmp_path)
     assert "--task-file" in result.stderr
 
 
-@pytest.mark.parametrize("via_stdin", [False, True])
-def test_task_file_invalid_utf8_is_rejected_naming_the_flag(tmp_path, via_stdin):
-    if via_stdin:
-        result = _invoke(CliRunner(), tmp_path, "-", input=b"bad bytes \xff\xfe")
-    else:
-        task_path = tmp_path / "task.md"
-        task_path.write_bytes(b"bad bytes \xff\xfe")
-        result = _invoke(CliRunner(), tmp_path, str(task_path))
+def test_task_file_invalid_utf8_is_rejected_naming_the_flag(tmp_path):
+    task_path = tmp_path / "task.md"
+    task_path.write_bytes(b"bad bytes \xff\xfe")
+    result = _invoke(CliRunner(), tmp_path, str(task_path))
     assert result.exit_code != 0
     assert "--task-file" in result.stderr
 

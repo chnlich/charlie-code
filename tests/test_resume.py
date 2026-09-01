@@ -21,7 +21,7 @@ def _json_lines(output):
     return [json.loads(line) for line in output.splitlines()]
 
 
-def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
+def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch, task_file):
     responses = iter([
         assistant(tool_calls=[tool_call(1, command="printf 'turn-one-output\\n'")]),
         assistant("Turn one complete."),
@@ -47,7 +47,7 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
         _cli_app(),
         [
             "--task-file",
-            "-",
+            task_file("turn one"),
             "--json",
             "--cwd",
             str(tmp_path),
@@ -56,7 +56,6 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
             "--steps",
             "4",
         ],
-        input="turn one",
     )
 
     assert first.exit_code == 0, first.output
@@ -82,7 +81,7 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
         _cli_app(),
         [
             "--task-file",
-            "-",
+            task_file("turn two"),
             "--resume",
             session_id,
             "--cwd",
@@ -92,7 +91,6 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
             "--steps",
             "4",
         ],
-        input="turn two",
     )
 
     assert second.exit_code == 0, second.output
@@ -110,7 +108,7 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
     )
 
 
-def test_resuming_a_pre_protocol_session_is_refused(tmp_path, monkeypatch):
+def test_resuming_a_pre_protocol_session_is_refused(tmp_path, monkeypatch, task_file):
     """An old bash-block history would tell the model to answer with fenced commands."""
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -121,10 +119,9 @@ def test_resuming_a_pre_protocol_session_is_refused(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["--task-file", "-", "--json", "--resume", "legacy",
+        ["--task-file", task_file("turn two"), "--json", "--resume", "legacy",
          "--cwd", str(tmp_path), "--session-dir", str(session_dir),
          "--steps", "2"],
-        input="turn two",
     )
 
     assert result.exit_code != 0

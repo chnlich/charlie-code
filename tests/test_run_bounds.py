@@ -36,7 +36,7 @@ def _spy_environments(monkeypatch):
     return created
 
 
-def test_wall_seconds_flag_overrides_the_config_default(tmp_path, monkeypatch):
+def test_wall_seconds_flag_overrides_the_config_default(tmp_path, monkeypatch, task_file):
     def query(self, messages, tools=None):
         raise AssertionError("model must not be queried once the wall budget is already spent")
 
@@ -45,11 +45,10 @@ def test_wall_seconds_flag_overrides_the_config_default(tmp_path, monkeypatch):
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "--task-file", "-", "--json", "--cwd", str(tmp_path),
+            "--task-file", task_file("do it"), "--json", "--cwd", str(tmp_path),
             "--session-dir", str(tmp_path / "sessions"),
             "--wall-seconds", "0",
         ],
-        input="do it",
     )
 
     assert result.exit_code != 0
@@ -58,7 +57,7 @@ def test_wall_seconds_flag_overrides_the_config_default(tmp_path, monkeypatch):
     assert "wall" in events[-1]["message"].lower()
 
 
-def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch):
+def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch, task_file):
     created = _spy_environments(monkeypatch)
 
     def query(self, messages, tools=None):
@@ -68,9 +67,8 @@ def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["--task-file", "-", "--cwd", str(tmp_path),
+        ["--task-file", task_file("finish"), "--cwd", str(tmp_path),
          "--session-dir", str(tmp_path / "sessions")],
-        input="finish",
     )
 
     assert result.exit_code == 0, result.output
@@ -82,15 +80,14 @@ def _raise_model_exploded(self, messages, tools=None):
     raise ValueError("model exploded")
 
 
-def test_log_dir_is_retained_and_path_printed_on_failure(tmp_path, monkeypatch):
+def test_log_dir_is_retained_and_path_printed_on_failure(tmp_path, monkeypatch, task_file):
     created = _spy_environments(monkeypatch)
     monkeypatch.setattr(Model, "query", _raise_model_exploded)
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["--task-file", "-", "--cwd", str(tmp_path),
+        ["--task-file", task_file("fail"), "--cwd", str(tmp_path),
          "--session-dir", str(tmp_path / "sessions")],
-        input="fail",
     )
 
     assert result.exit_code != 0
@@ -100,7 +97,7 @@ def test_log_dir_is_retained_and_path_printed_on_failure(tmp_path, monkeypatch):
     assert log_dir in result.stderr
 
 
-def test_log_dir_retention_message_stays_off_the_json_stream(tmp_path, monkeypatch):
+def test_log_dir_retention_message_stays_off_the_json_stream(tmp_path, monkeypatch, task_file):
     """The forensic path print must not corrupt the NDJSON error event's shape."""
     created = _spy_environments(monkeypatch)
     monkeypatch.setattr(Model, "query", _raise_model_exploded)
@@ -108,10 +105,9 @@ def test_log_dir_retention_message_stays_off_the_json_stream(tmp_path, monkeypat
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "--task-file", "-", "--json", "--cwd", str(tmp_path),
+            "--task-file", task_file("fail"), "--json", "--cwd", str(tmp_path),
             "--session-dir", str(tmp_path / "sessions"),
         ],
-        input="fail",
     )
 
     assert result.exit_code != 0
@@ -123,7 +119,7 @@ def test_log_dir_retention_message_stays_off_the_json_stream(tmp_path, monkeypat
 
 
 def test_keyboard_interrupt_sweeps_the_environment_via_both_wired_call_sites(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, task_file
 ):
     sweep_calls = []
     original_sweep = Environment.sweep
@@ -140,9 +136,8 @@ def test_keyboard_interrupt_sweeps_the_environment_via_both_wired_call_sites(
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["--task-file", "-", "--cwd", str(tmp_path),
+        ["--task-file", task_file("do it"), "--cwd", str(tmp_path),
          "--session-dir", str(tmp_path / "sessions")],
-        input="do it",
     )
 
     assert result.exit_code != 0

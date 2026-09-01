@@ -39,7 +39,7 @@ charlie-code --task-file TASK.md [--model M] [--api-base URL] [--cwd DIR] [--ste
 ```
 
 - `--task-file PATH` (required) supplies the task text: the file's full UTF-8
-  contents verbatim; `-` reads it from stdin instead.
+  contents verbatim.
 - `--cwd` is the repo the agent operates in (default: current directory).
 - `--steps` is the hard step limit (default: 40). Exceeding it fails loudly.
 - `--wall-seconds` is the hard episode wall-clock budget in seconds (default: 3600).
@@ -53,7 +53,8 @@ charlie-code --task-file TASK.md [--model M] [--api-base URL] [--cwd DIR] [--ste
 Example:
 
 ```bash
-echo "create a file hello.txt containing hi, then finish" | charlie-code --task-file - --cwd /tmp/demo
+printf 'create a file hello.txt containing hi, then finish\n' > /tmp/demo-task.md
+charlie-code --task-file /tmp/demo-task.md --cwd /tmp/demo
 ```
 
 The full trajectory (thought / command / observation per step) is printed to stdout,
@@ -157,7 +158,8 @@ reachable):
 curl -sf https://YOUR_SGLANG_HOST/v1/models
 
 mkdir -p /tmp/cc_demo
-echo "create a file hello.txt containing hi, then finish" | charlie-code --task-file - --cwd /tmp/cc_demo --steps 10
+printf 'create a file hello.txt containing hi, then finish\n' > /tmp/cc_demo-task.md
+charlie-code --task-file /tmp/cc_demo-task.md --cwd /tmp/cc_demo --steps 10
 cat /tmp/cc_demo/hello.txt   # -> hi
 ```
 

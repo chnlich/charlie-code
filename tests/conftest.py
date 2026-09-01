@@ -60,3 +60,20 @@ def templates():
     from agent import load_config
 
     return load_config()["templates"]
+
+
+@pytest.fixture
+def task_file(tmp_path):
+    """Deliver a CLI task through a real temp file, never argv or stdin.
+
+    --task-file accepts only a real readable file, so CLI tests write the
+    task text with `task_file("...")` and pass the returned path. Rewrites
+    reuse the same path within one test.
+    """
+
+    def write(text):
+        path = tmp_path / "task.md"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    return write

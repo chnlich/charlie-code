@@ -354,7 +354,7 @@ def _cli_app():
     return app
 
 
-def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch):
+def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch, task_file):
     real_load_config = load_config
 
     def patched_load_config():
@@ -384,9 +384,8 @@ def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch):
     runner = CliRunner()
     first = runner.invoke(
         _cli_app(),
-        ["--task-file", "-", "--json", "--cwd", str(tmp_path),
+        ["--task-file", task_file("turn one"), "--json", "--cwd", str(tmp_path),
          "--session-dir", str(session_dir), "--steps", "6"],
-        input="turn one",
     )
 
     assert first.exit_code == 0, first.output
@@ -404,9 +403,8 @@ def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch):
 
     second = runner.invoke(
         _cli_app(),
-        ["--task-file", "-", "--json", "--resume", session_id,
+        ["--task-file", task_file("turn two"), "--json", "--resume", session_id,
          "--cwd", str(tmp_path), "--session-dir", str(session_dir), "--steps", "3"],
-        input="turn two",
     )
 
     assert second.exit_code == 0, second.output
@@ -423,7 +421,7 @@ def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch):
 # so the trigger is threshold_fraction x the flag's window.
 # ---------------------------------------------------------------------------
 
-def _cli_episode_with_window(runner, tmp_path, monkeypatch, window):
+def _cli_episode_with_window(runner, tmp_path, monkeypatch, window, task_file):
     """One CLI episode over a pinned two-step history, with --context-window.
 
     Injected prompt_tokens land the step-3 anchored estimate strictly between
@@ -444,14 +442,16 @@ def _cli_episode_with_window(runner, tmp_path, monkeypatch, window):
     monkeypatch.setattr(Model, "query", query)
     return runner.invoke(
         _cli_app(),
-        ["--task-file", "-", "--json", "--cwd", str(tmp_path),
+        ["--task-file", task_file("trigger arithmetic"), "--json",
+         "--cwd", str(tmp_path),
          "--session-dir", str(tmp_path / "sessions"), "--steps", "5",
          "--context-window", str(window)],
-        input="trigger arithmetic",
     )
 
 
-def test_context_window_flag_scales_the_trigger_multiplicatively(tmp_path, monkeypatch):
+def test_context_window_flag_scales_the_trigger_multiplicatively(
+    tmp_path, monkeypatch, task_file
+):
     """Same history, same injected prompt_tokens: window W fires a threshold
     compaction, window 2W does not (asserting threshold_fraction x effective
     window, not a single point)."""
@@ -466,7 +466,7 @@ def test_context_window_flag_scales_the_trigger_multiplicatively(tmp_path, monke
     runner = CliRunner()
     window = 10000  # threshold = 0.5 x window
 
-    fired = _cli_episode_with_window(runner, tmp_path, monkeypatch, window)
+    fired = _cli_episode_with_window(runner, tmp_path, monkeypatch, window, task_file)
     assert fired.exit_code == 0, fired.output
     events = [json.loads(line) for line in fired.stdout.splitlines()]
     compact_events = [e for e in events if e["type"] == "compact"]
@@ -478,20 +478,22 @@ def test_context_window_flag_scales_the_trigger_multiplicatively(tmp_path, monke
     # have decided both directions.
     assert 0.5 * window <= event["pre_tokens"] < 0.5 * 2 * window
 
-    spared = _cli_episode_with_window(runner, tmp_path, monkeypatch, 2 * window)
+    spared = _cli_episode_with_window(runner, tmp_path, monkeypatch, 2 * window, task_file)
     assert spared.exit_code == 0, spared.output
     events = [json.loads(line) for line in spared.stdout.splitlines()]
     assert not any(e["type"] == "compact" for e in events)
 
 
 @pytest.mark.parametrize("bad_value", ["0", "-7"])
-def test_context_window_below_one_is_rejected_naming_the_flag(tmp_path, bad_value):
+def test_context_window_below_one_is_rejected_naming_the_flag(
+    tmp_path, bad_value, task_file
+):
     result = CliRunner().invoke(
         _cli_app(),
-        ["--task-file", "-", "--json", "--cwd", str(tmp_path),
+        ["--task-file", task_file("window validation"), "--json",
+         "--cwd", str(tmp_path),
          "--session-dir", str(tmp_path / "sessions"),
          f"--context-window={bad_value}"],
-        input="window validation",
     )
     assert result.exit_code != 0
     assert "--context-window" in result.stderr

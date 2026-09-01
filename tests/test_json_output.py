@@ -35,7 +35,7 @@ def _patch_model(monkeypatch, *responses, usage=None):
     )
 
 
-def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
+def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch, task_file):
     _patch_model(
         monkeypatch,
         assistant("Writing file.", tool_calls=[tool_call(1, command="printf hi > out.txt")]),
@@ -46,7 +46,7 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
         _cli_app(),
         [
             "--task-file",
-            "-",
+            task_file("write file"),
             "--json",
             "--cwd",
             str(tmp_path),
@@ -55,7 +55,6 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
             "--steps",
             "3",
         ],
-        input="write file",
     )
 
     assert result.exit_code == 0
@@ -78,7 +77,7 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
     assert (tmp_path / "out.txt").read_text() == "hi"
 
 
-def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
+def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch, task_file):
     _patch_model(
         monkeypatch,
         assistant("Still working.", tool_calls=[tool_call(1, command="echo not_done")]),
@@ -88,7 +87,7 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
         _cli_app(),
         [
             "--task-file",
-            "-",
+            task_file("never complete"),
             "--json",
             "--cwd",
             str(tmp_path),
@@ -97,7 +96,6 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
             "--steps",
             "1",
         ],
-        input="never complete",
     )
 
     assert result.exit_code != 0
@@ -107,7 +105,7 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
     assert "Step limit (1) exceeded" in events[-1]["message"]
 
 
-def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
+def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch, task_file):
     def query(self, messages, tools=None):
         raise ValueError("model exploded")
 
@@ -118,7 +116,7 @@ def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch
         _cli_app(),
         [
             "--task-file",
-            "-",
+            task_file("fail"),
             "--json",
             "--cwd",
             str(tmp_path),
@@ -127,7 +125,6 @@ def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch
             "--steps",
             "3",
         ],
-        input="fail",
     )
 
     assert result.exit_code != 0

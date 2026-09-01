@@ -239,7 +239,7 @@ def _parse_result_event(ndjson_text):
     return result, error
 
 
-def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter):
+def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter, task_file):
     """Run one charlie-code episode non-interactively; return (ndjson, fail_class, wall_s)."""
     session_dir = work_dir / ".cc-sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -253,9 +253,10 @@ def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter):
     ]
     if model_cfg.get("context_window") is not None:
         argv += ["--context-window", str(model_cfg["context_window"])]
-    # The prompt rides stdin, never argv: an argv element caps at 128 KiB
-    # (MAX_ARG_STRLEN) and is world-readable via /proc/<pid>/cmdline.
-    argv += ["--task-file", "-"]
+    # The prompt rides a task file outside the agent's cwd, never argv: an
+    # argv element caps at 128 KiB (MAX_ARG_STRLEN) and is world-readable via
+    # /proc/<pid>/cmdline.
+    argv += ["--task-file", str(task_file)]
     child_env = dict(os.environ)
     child_env["CHARLIE_CODE_API_KEY"] = model_cfg["api_key"]
     child_env["LITELLM_LOG"] = "ERROR"
@@ -271,7 +272,7 @@ def run_episode(task, model_cfg, work_dir, episode_timeout, interpreter):
     start = time.perf_counter()
     try:
         proc = subprocess.run(
-            argv, input=task["prompt"], capture_output=True, text=True,
+            argv, capture_output=True, text=True,
             timeout=episode_timeout, env=child_env,
         )
         wall_s = time.perf_counter() - start
@@ -390,11 +391,17 @@ def aggregate(model_id, suite, k, per_task_runs):
 
 def _run_one(task, rep, model_cfg, out_dir, traj_dir, interpreter):
     """Run one (task, repeat) pair and write its trajectory. Returns the run record."""
-    with tempfile.TemporaryDirectory(prefix=f"eval-{task['id']}-") as work_dir:
-        work_dir = Path(work_dir)
+    with tempfile.TemporaryDirectory(prefix=f"eval-{task['id']}-") as tmp_dir:
+        tmp_dir = Path(tmp_dir)
+        # The task file sits next to the agent's cwd, not inside it: an agent
+        # `ls` (or the grader running in the cwd) must not see the task text.
+        work_dir = tmp_dir / "work"
+        task_file = tmp_dir / "task.md"
+        task_file.write_text(task["prompt"], encoding="utf-8")
         materialize_fixture(task["_fixture"], work_dir)
         episode_timeout = max(task["step_limit"] * 120, 600)
-        ndjson, ep_fail, ep_wall = run_episode(task, model_cfg, work_dir, episode_timeout, interpreter)
+        ndjson, ep_fail, ep_wall = run_episode(
+            task, model_cfg, work_dir, episode_timeout, interpreter, task_file)
         traj_path = traj_dir / f"{task['id']}.{rep}.ndjson"
         traj_path.write_text(ndjson)
         grader_exit, grader_fail = run_grader(task["_grade"], work_dir, task["timeout_s"])
