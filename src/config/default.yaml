@@ -17,7 +17,8 @@ agent:
 # context_window, old tool observations are masked with re-readable placeholders,
 # and if that is still not enough the history is rebuilt as [system, task,
 # summary, verbatim tail]. An over-window error from the endpoint runs the same
-# compaction and retries the call once.
+# compaction and retries the call once. context_window can be overridden per
+# invocation with --context-window.
 #
 # Config invariant: mask_keep_steps x the per-step entry budget plus
 # tail_budget_tokens plus fixed overhead (system + task + summary) must leave

@@ -45,10 +45,11 @@ def test_wall_seconds_flag_overrides_the_config_default(tmp_path, monkeypatch):
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "do it", "--json", "--cwd", str(tmp_path),
+            "--task-file", "-", "--json", "--cwd", str(tmp_path),
             "--session-dir", str(tmp_path / "sessions"),
             "--wall-seconds", "0",
         ],
+        input="do it",
     )
 
     assert result.exit_code != 0
@@ -67,7 +68,9 @@ def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["finish", "--cwd", str(tmp_path), "--session-dir", str(tmp_path / "sessions")],
+        ["--task-file", "-", "--cwd", str(tmp_path),
+         "--session-dir", str(tmp_path / "sessions")],
+        input="finish",
     )
 
     assert result.exit_code == 0, result.output
@@ -85,7 +88,9 @@ def test_log_dir_is_retained_and_path_printed_on_failure(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["fail", "--cwd", str(tmp_path), "--session-dir", str(tmp_path / "sessions")],
+        ["--task-file", "-", "--cwd", str(tmp_path),
+         "--session-dir", str(tmp_path / "sessions")],
+        input="fail",
     )
 
     assert result.exit_code != 0
@@ -103,9 +108,10 @@ def test_log_dir_retention_message_stays_off_the_json_stream(tmp_path, monkeypat
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "fail", "--json", "--cwd", str(tmp_path),
+            "--task-file", "-", "--json", "--cwd", str(tmp_path),
             "--session-dir", str(tmp_path / "sessions"),
         ],
+        input="fail",
     )
 
     assert result.exit_code != 0
@@ -134,7 +140,9 @@ def test_keyboard_interrupt_sweeps_the_environment_via_both_wired_call_sites(
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["do it", "--cwd", str(tmp_path), "--session-dir", str(tmp_path / "sessions")],
+        ["--task-file", "-", "--cwd", str(tmp_path),
+         "--session-dir", str(tmp_path / "sessions")],
+        input="do it",
     )
 
     assert result.exit_code != 0

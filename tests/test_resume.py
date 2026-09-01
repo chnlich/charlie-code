@@ -46,7 +46,8 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
     first = runner.invoke(
         _cli_app(),
         [
-            "turn one",
+            "--task-file",
+            "-",
             "--json",
             "--cwd",
             str(tmp_path),
@@ -55,6 +56,7 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
             "--steps",
             "4",
         ],
+        input="turn one",
     )
 
     assert first.exit_code == 0, first.output
@@ -79,7 +81,8 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
     second = runner.invoke(
         _cli_app(),
         [
-            "turn two",
+            "--task-file",
+            "-",
             "--resume",
             session_id,
             "--cwd",
@@ -89,6 +92,7 @@ def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch):
             "--steps",
             "4",
         ],
+        input="turn two",
     )
 
     assert second.exit_code == 0, second.output
@@ -117,8 +121,10 @@ def test_resuming_a_pre_protocol_session_is_refused(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         _cli_app(),
-        ["turn two", "--json", "--resume", "legacy", "--cwd", str(tmp_path),
-         "--session-dir", str(session_dir), "--steps", "2"],
+        ["--task-file", "-", "--json", "--resume", "legacy",
+         "--cwd", str(tmp_path), "--session-dir", str(session_dir),
+         "--steps", "2"],
+        input="turn two",
     )
 
     assert result.exit_code != 0

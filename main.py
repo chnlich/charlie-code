@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import uuid
+from pathlib import Path
 
 import typer
 
@@ -15,6 +16,34 @@ from agent import Agent, load_config
 from environment import Environment
 from model import Model
 from skills import load_skill_catalog
+
+
+def _read_task(task_file):
+    """The task text from --task-file, verbatim.
+
+    PATH of '-' reads sys.stdin. Decoding is strict UTF-8 (no errors="replace":
+    the task is an explicit user choice, so a bad byte stops the run), and
+    empty-after-strip content is an error. Failure always names the flag.
+    """
+    source = "stdin" if task_file == "-" else repr(task_file)
+    if task_file == "-":
+        raw = sys.stdin.buffer.read()
+    else:
+        try:
+            raw = Path(task_file).read_bytes()
+        except OSError as exc:
+            raise typer.BadParameter(
+                f"--task-file: cannot read {task_file!r}: {exc.strerror or exc}"
+            ) from None
+    try:
+        task = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise typer.BadParameter(
+            f"--task-file: {source} is not valid UTF-8 ({exc})"
+        ) from None
+    if not task.strip():
+        raise typer.BadParameter(f"--task-file: {source} contains no task text")
+    return task
 
 
 def _print_log_retention(environment):
@@ -41,7 +70,12 @@ def _print_trajectory(result):
 
 
 def run(
-    task: str = typer.Argument(..., help="The task for the agent to solve."),
+    task_file: str = typer.Option(
+        ...,
+        "--task-file",
+        help="Read the task text from PATH ('-' reads stdin). The file's full "
+        "UTF-8 text is the task, verbatim; it never rides argv.",
+    ),
     model: str = typer.Option(None, "--model", help="litellm model id override."),
     api_base: str = typer.Option(
         None, "--api-base", help="OpenAI-compatible API base URL override."
@@ -60,6 +94,11 @@ def run(
     wall_seconds: int = typer.Option(
         None, "--wall-seconds", help="Hard episode wall-clock budget override, in seconds."
     ),
+    context_window: int = typer.Option(
+        None,
+        "--context-window",
+        help="Compaction context-window override, in tokens, for this invocation.",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -75,7 +114,14 @@ def run(
     else:
         _emit = None
 
+    task = _read_task(task_file)
+    if context_window is not None and context_window < 1:
+        raise typer.BadParameter("--context-window must be an integer >= 1.")
+
     config = load_config()
+    if context_window is not None:
+        # Per-invocation override only; the rest of the compact block is untouched.
+        config["compact"]["context_window"] = context_window
 
     model_name = (
         model or os.environ.get("CHARLIE_CODE_MODEL") or config["model"]["model_name"]

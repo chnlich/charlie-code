@@ -45,7 +45,8 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "write file",
+            "--task-file",
+            "-",
             "--json",
             "--cwd",
             str(tmp_path),
@@ -54,6 +55,7 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch):
             "--steps",
             "3",
         ],
+        input="write file",
     )
 
     assert result.exit_code == 0
@@ -85,7 +87,8 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "never complete",
+            "--task-file",
+            "-",
             "--json",
             "--cwd",
             str(tmp_path),
@@ -94,6 +97,7 @@ def test_json_step_limit_emits_error_and_nonzero_exit(tmp_path, monkeypatch):
             "--steps",
             "1",
         ],
+        input="never complete",
     )
 
     assert result.exit_code != 0
@@ -113,7 +117,8 @@ def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch
     result = CliRunner().invoke(
         _cli_app(),
         [
-            "fail",
+            "--task-file",
+            "-",
             "--json",
             "--cwd",
             str(tmp_path),
@@ -122,6 +127,7 @@ def test_json_model_exception_emits_error_and_nonzero_exit(tmp_path, monkeypatch
             "--steps",
             "3",
         ],
+        input="fail",
     )
 
     assert result.exit_code != 0

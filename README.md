@@ -35,9 +35,11 @@ pip install -e ".[dev]"   # also installs pytest for the smoke test
 ## Run
 
 ```bash
-charlie-code "<task>" [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--wall-seconds N]
+charlie-code --task-file TASK.md [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--wall-seconds N]
 ```
 
+- `--task-file PATH` (required) supplies the task text: the file's full UTF-8
+  contents verbatim; `-` reads it from stdin instead.
 - `--cwd` is the repo the agent operates in (default: current directory).
 - `--steps` is the hard step limit (default: 40). Exceeding it fails loudly.
 - `--wall-seconds` is the hard episode wall-clock budget in seconds (default: 3600).
@@ -51,7 +53,7 @@ charlie-code "<task>" [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--wa
 Example:
 
 ```bash
-charlie-code "create a file hello.txt containing hi, then finish" --cwd /tmp/demo
+echo "create a file hello.txt containing hi, then finish" | charlie-code --task-file - --cwd /tmp/demo
 ```
 
 The full trajectory (thought / command / observation per step) is printed to stdout,
@@ -155,7 +157,7 @@ reachable):
 curl -sf https://YOUR_SGLANG_HOST/v1/models
 
 mkdir -p /tmp/cc_demo
-charlie-code "create a file hello.txt containing hi, then finish" --cwd /tmp/cc_demo --steps 10
+echo "create a file hello.txt containing hi, then finish" | charlie-code --task-file - --cwd /tmp/cc_demo --steps 10
 cat /tmp/cc_demo/hello.txt   # -> hi
 ```
 
