@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from agent import BASH_TOOL, Agent, gate_output
+from agent import BASH_TOOL, Agent, gate_output, render
 from conftest import ScriptedModel, assistant, tool_call
 from environment import Environment
 
@@ -259,3 +259,83 @@ def test_run_finally_sweeps_the_environment_on_success_and_on_failure(tmp_path, 
     with pytest.raises(RuntimeError, match=r"Step limit \(1\) exceeded"):
         failing_agent.run("never finish")
     assert fail_env.swept is True
+
+
+def test_fresh_session_appends_cwd_agents_md_to_system_message(tmp_path, templates):
+    """The AGENTS.md convention: a fresh session carries the cwd's file in the
+    system message, appended after the built-in template."""
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text("Always run the test suite before finishing.\n",
+                         encoding="utf-8")
+    agent = _agent(tmp_path, templates, assistant("done"))
+
+    agent.run("count")
+
+    template = render(templates["system"], cwd=str(tmp_path), skills="")
+    content = agent.messages[0]["content"]
+    assert content == template + "\n\n" + agents_md.read_text(encoding="utf-8")
+    assert content.index("autonomous software engineering agent") < content.index(
+        "Always run the test suite"
+    )
+
+
+def test_fresh_session_skips_missing_or_blank_agents_md(tmp_path, templates):
+    template = render(templates["system"], cwd=str(tmp_path), skills="")
+
+    agent = _agent(tmp_path, templates, assistant("done"))
+    agent.run("count")
+    assert agent.messages[0]["content"] == template
+
+    (tmp_path / "AGENTS.md").write_text("\n   \n", encoding="utf-8")
+    blank = _agent(tmp_path, templates, assistant("done"))
+    blank.run("count")
+    assert blank.messages[0]["content"] == template
+
+
+def test_undecodable_agents_md_warns_on_stderr_and_session_continues(
+        tmp_path, templates, capsys):
+    """An unreadable convention file must not kill a session for an unrelated task."""
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_bytes(b"\xff\xfe not utf-8")
+    agent = _agent(tmp_path, templates, assistant("done"))
+
+    result = agent.run("count")
+
+    assert result["completed"] is True
+    assert agent.messages[0]["content"] == render(
+        templates["system"], cwd=str(tmp_path), skills=""
+    )
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert str(agents_md) in err
+
+
+def test_resume_replays_stored_system_text_without_rereading_agents_md(
+        tmp_path, templates):
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text("original convention\n", encoding="utf-8")
+    state_file = tmp_path / "session.json"
+    first = Agent(
+        model=ScriptedModel(assistant("done")),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=templates,
+        step_limit=5,
+        state_file=str(state_file),
+    )
+    first.run("count")
+    original_system = first.messages[0]["content"]
+    assert "original convention" in original_system
+
+    agents_md.write_text("changed convention\n", encoding="utf-8")
+    resumed = Agent(
+        model=ScriptedModel(assistant("done again")),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=templates,
+        step_limit=5,
+        state_file=str(state_file),
+        resume=True,
+    )
+    resumed.run("count again")
+
+    assert resumed.messages[0]["content"] == original_system
+    assert "changed convention" not in resumed.messages[0]["content"]

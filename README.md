@@ -60,6 +60,15 @@ charlie-code --task-file /tmp/demo-task.md --cwd /tmp/demo
 The full trajectory (thought / command / observation per step) is printed to stdout,
 followed by a summary line with step count and token usage.
 
+### AGENTS.md convention
+
+On a **fresh** session start, charlie-code reads `AGENTS.md` from the working
+directory (`--cwd`): when the file is present, its full text is appended after
+the rendered system template in the system message. A missing or whitespace-only
+file is silently skipped; a file that cannot be read or decoded as UTF-8
+produces one stderr warning naming the file, and the session continues without
+it. Resumed sessions replay the stored history and never re-read the file.
+
 ### How a run ends
 
 The agent drives the endpoint's native tool calling: it offers exactly one tool,

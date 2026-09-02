@@ -132,6 +132,27 @@ def _load_state(state_path):
     return state["messages"]
 
 
+def read_agents_md(cwd):
+    """The cwd's AGENTS.md text for a fresh session's system message, or "".
+
+    The file is an environment convention scanned at startup, like CLAUDE.md for
+    Claude Code, not something the run selected -- so a missing or blank file is
+    simply no convention (silent), while an unreadable one must not kill a
+    session launched for an unrelated task: one stderr warning, then continue
+    without it. Resumed sessions never get here; their history already carries
+    whatever the file said when they were fresh.
+    """
+    path = Path(cwd) / "AGENTS.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except (UnicodeDecodeError, OSError) as exc:
+        print(f"warning: skipping unreadable {path}: {exc}", file=sys.stderr)
+        return ""
+    return text if text.strip() else ""
+
+
 class Agent:
     def __init__(
         self,
@@ -187,12 +208,16 @@ class Agent:
             })
             return messages
 
+        system = render(
+            self.templates["system"],
+            cwd=self.environment.cwd,
+            skills=self.skills_catalog,
+        )
+        agents_md = read_agents_md(self.environment.cwd)
+        if agents_md:
+            system += "\n\n" + agents_md
         return [
-            {"role": "system", "content": render(
-                self.templates["system"],
-                cwd=self.environment.cwd,
-                skills=self.skills_catalog,
-            )},
+            {"role": "system", "content": system},
             {"role": "user", "content": render(self.templates["instance"], task=task)},
         ]
 
