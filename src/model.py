@@ -3,7 +3,10 @@
 `query` hands back the assistant message exactly as the endpoint sent it, plus the
 envelope's finish reason. The whole message is what goes back on the next turn:
 Kimi K3 is trained in preserved-thinking-history mode and needs `reasoning_content`
-and `tool_calls` returned as-is, not just `content`.
+and `tool_calls` returned as-is, not just `content`. The request itself carries no
+reasoning knobs: endpoints separate reasoning server-side and strict OpenAI-compatible
+layers reject unknown fields, which is why the old `extra_body={"separate_reasoning":
+True}` was removed.
 
 Some endpoints still leak reasoning into `content` as an orphan closing `</think>`
 (SGLang issue #4711). `strip_leaked_reasoning` cleans that up for display text only;
@@ -61,7 +64,6 @@ class Model:
             api_key=self.api_key,
             timeout=self.model_timeout,
             num_retries=0,
-            extra_body={"separate_reasoning": True},
         )
         self.n_calls += 1
         usage = response.usage

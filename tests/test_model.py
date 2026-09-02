@@ -68,3 +68,36 @@ def test_num_retries_zero_bounds_a_stalled_call_to_one_attempt(monkeypatch):
 
     # 1 attempt, not the 3 a hidden default max_retries=2 would cost.
     assert elapsed < model_timeout * 2
+
+
+def test_query_sends_no_request_side_reasoning_fields(monkeypatch):
+    """Endpoints separate reasoning server-side and strict OpenAI-compatible layers
+    reject unknown request fields, so nothing like the removed `extra_body` /
+    `separate_reasoning` knob may reach litellm.completion."""
+    sent = {}
+
+    def fake_completion(**kwargs):
+        sent.update(kwargs)
+        raise TimeoutError("endpoint stalled")
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    model = Model(model_name="m", api_base="http://x/v1", api_key="k", model_timeout=7)
+
+    with pytest.raises(TimeoutError):
+        model.query([{"role": "user", "content": "hi"}])
+
+    def walk(value):
+        """Yield every dict key and scalar anywhere inside the call kwargs."""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield key
+                yield from walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from walk(item)
+        else:
+            yield value
+
+    keys_and_scalars = list(walk(sent))
+    assert "extra_body" not in keys_and_scalars
+    assert "separate_reasoning" not in keys_and_scalars
