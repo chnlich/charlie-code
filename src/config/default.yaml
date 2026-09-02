@@ -5,7 +5,7 @@
 model:
   model_name: "openai/your-org/your-model"
   api_base: "https://YOUR_SGLANG_HOST/v1"
-  model_timeout: 300
+  model_timeout: 1200
 
 agent:
   step_limit: 40
