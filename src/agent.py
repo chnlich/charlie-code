@@ -13,6 +13,11 @@ reaches the threshold, old observations are masked (lossless: re-run to re-read)
 and when that is not enough a structured summary plus a verbatim tail replaces the
 history. An over-window error from the endpoint runs the same compaction and
 retries the call once instead of killing the session.
+
+Every message enters history through `Agent._append_message`, which rewrites the
+session state file atomically on each append: a process killed at any moment
+(SIGTERM from a manual stop, SIGKILL, OOM) loses at most the message in flight,
+and resuming such a file first answers any tool call the kill left unanswered.
 """
 
 import json
@@ -132,6 +137,43 @@ def _load_state(state_path):
     return state["messages"]
 
 
+INTERRUPTED_TOOL_RESULT = (
+    "[interrupted: the session was stopped before this tool call returned]"
+)
+
+
+def repair_dangling_tool_calls(messages):
+    """Answer every tool call that has no tool message, in place.
+
+    Per-message persistence writes an assistant's tool calls before their
+    results, so a session killed mid-step leaves calls without answers, and a
+    history like that is invalid for the model API. Each unanswered call gets a
+    placeholder tool message stating the interruption, placed after the step's
+    existing tool messages; no result is ever invented. Returns the count added.
+    """
+    added = 0
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        answered = {messages[k].get("tool_call_id") for k in range(index + 1, end)}
+        placeholders = [
+            {"role": "tool", "tool_call_id": call.get("id"),
+             "content": INTERRUPTED_TOOL_RESULT}
+            for call in (message.get("tool_calls") or [])
+            if call.get("id") not in answered
+        ]
+        messages[end:end] = placeholders
+        added += len(placeholders)
+        index = end + len(placeholders)
+    return added
+
+
 def read_agents_md(cwd):
     """The cwd's AGENTS.md text for a fresh session's system message, or "".
 
@@ -199,13 +241,23 @@ class Agent:
                 f"{elapsed:.1f}s."
             )
 
-    def _initial_messages(self, task):
-        if self.resume and self.state_file and Path(self.state_file).exists():
-            messages = _load_state(Path(self.state_file))
-            messages.append({
-                "role": "user",
-                "content": render(self.templates["instance"], task=task),
-            })
+    def _initial_messages(self):
+        """History before this turn's task message.
+
+        A resumed session's file is loaded and repaired; a fresh session starts
+        from its system message alone. The task message itself enters through
+        `_append_message` in `run`, so it reaches the state file before the
+        first model call. `--resume` names an explicit target, so a missing
+        state file is an error, never a silent fresh start.
+        """
+        if self.resume:
+            state_path = Path(self.state_file) if self.state_file else None
+            if state_path is None or not state_path.exists():
+                raise RuntimeError(
+                    f"Cannot resume: session state file {state_path} does not exist."
+                )
+            messages = _load_state(state_path)
+            repair_dangling_tool_calls(messages)
             return messages
 
         system = render(
@@ -216,10 +268,17 @@ class Agent:
         agents_md = read_agents_md(self.environment.cwd)
         if agents_md:
             system += "\n\n" + agents_md
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": render(self.templates["instance"], task=task)},
-        ]
+        return [{"role": "system", "content": system}]
+
+    def _append_message(self, message):
+        """The one way a message enters history: append, then persist.
+
+        Persisting on every append bounds what a kill at any moment can lose to
+        the message being produced; the file on disk is otherwise always the
+        complete history so far.
+        """
+        self.messages.append(message)
+        self._persist_messages()
 
     def _persist_messages(self):
         if self.state_file is None:
@@ -254,7 +313,7 @@ class Agent:
             if error is not None:
                 bounded, charged = bound_observation(error, remaining)
                 remaining -= charged
-                self.messages.append({"role": "tool",
+                self._append_message({"role": "tool",
                                       "tool_call_id": tool_call.get("id"),
                                       "content": bounded})
                 records.append({"thought": step_thought, "command": None,
@@ -283,7 +342,7 @@ class Agent:
                 observation = f"[{note}]\n{observation}"
             bounded, charged = bound_observation(observation, remaining)
             remaining -= charged
-            self.messages.append({"role": "tool",
+            self._append_message({"role": "tool",
                                   "tool_call_id": tool_call.get("id"),
                                   "content": bounded})
             records.append({"thought": step_thought, "command": command,
@@ -427,7 +486,11 @@ class Agent:
             return text
 
     def run(self, task):
-        self.messages = self._initial_messages(task)
+        self.messages = self._initial_messages()
+        self._append_message({
+            "role": "user",
+            "content": render(self.templates["instance"], task=task),
+        })
         self._start_time = time.monotonic()
         steps = []
         try:
@@ -435,7 +498,7 @@ class Agent:
                 self._check_wall()
                 self._maybe_compact(step_idx)
                 message, finish_reason = self._query_step(step_idx)
-                self.messages.append(message)
+                self._append_message(message)
                 self._check_wall()
                 thought = strip_leaked_reasoning(message.get("content") or "").strip()
                 if self.emit and thought:
@@ -463,7 +526,7 @@ class Agent:
                             "usage": self.model.usage()}
 
                 observation = self.templates["empty_response_reminder"]
-                self.messages.append({"role": "user", "content": observation})
+                self._append_message({"role": "user", "content": observation})
                 steps.append({"thought": "", "command": None,
                               "observation": observation, "note": "empty response"})
 
