@@ -8,7 +8,7 @@ model:
   model_timeout: 1200
 
 agent:
-  step_limit: 40
+  step_limit: 1000
   wall_seconds: 3600
 
 # Layered context compaction. Every observation entering history is bounded by the

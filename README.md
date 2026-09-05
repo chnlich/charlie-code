@@ -41,7 +41,7 @@ charlie-code --task-file TASK.md [--model M] [--api-base URL] [--cwd DIR] [--ste
 - `--task-file PATH` (required) supplies the task text: the file's full UTF-8
   contents verbatim.
 - `--cwd` is the repo the agent operates in (default: current directory).
-- `--steps` is the hard step limit (default: 40). Exceeding it fails loudly.
+- `--steps` is the hard step limit (default: 1000). Exceeding it fails loudly.
 - `--wall-seconds` is the hard episode wall-clock budget in seconds (default: 3600).
   Exceeding it fails loudly, checked at step boundaries, right after every model
   call, and between individual tool calls within a step.
@@ -84,7 +84,7 @@ The agent drives the endpoint's native tool calling: it offers exactly one tool,
   them apart, and guessing would silently accept a half-finished answer.
 - **Empty reply.** No tool call and no text ends nothing; a short reminder is
   appended and the loop continues.
-- **Step limit.** The loop raises after `--steps` steps (default 40) — it fails loud
+- **Step limit.** The loop raises after `--steps` steps (default 1000) — it fails loud
   rather than silently stopping.
 - **Withheld output.** Command output containing a model's own structure markers is
   not fed back. The serving stack parses generated text back into tool calls, so a
