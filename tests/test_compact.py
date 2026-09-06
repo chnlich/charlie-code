@@ -40,6 +40,7 @@ class CompactModel:
 
     def __init__(self, *steps):
         self._steps = list(steps)
+        self.model_name = "openai/fake-model"
         self.last_prompt_tokens = None
         self.seen_tools = []
         self.seen_prompts = []

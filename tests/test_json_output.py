@@ -2,6 +2,7 @@ import json
 
 import pytest
 import typer
+from litellm.exceptions import ContextWindowExceededError
 from typer.testing import CliRunner
 
 import main as cli_main
@@ -35,6 +36,38 @@ def _patch_model(monkeypatch, *responses, usage=None):
     )
 
 
+OVERFLOW = "OVERFLOW"
+
+
+class UsageModel:
+    """Stands in for Model: scripted (reply, prompt_tokens) steps.
+
+    reply is an (assistant message, finish_reason) pair or the OVERFLOW sentinel
+    (raises a context-window error and leaves usage unset, like the endpoint).
+    prompt_tokens is that response's usage.prompt_tokens; None means the
+    response carried no usage.
+    """
+
+    def __init__(self, *steps, model_name="openai/fake-model"):
+        self.model_name = model_name
+        self._steps = iter(steps)
+        self.last_prompt_tokens = None
+        self.seen_tools = []
+
+    def query(self, messages, tools=None):
+        self.seen_tools.append(tools)
+        reply, prompt_tokens = next(self._steps)
+        if reply == OVERFLOW:
+            raise ContextWindowExceededError(
+                "prompt is too long", model="fake", llm_provider="fake"
+            )
+        self.last_prompt_tokens = prompt_tokens
+        return reply
+
+    def usage(self):
+        return {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
+
+
 def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch, task_file):
     _patch_model(
         monkeypatch,
@@ -61,16 +94,20 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch, task_f
     events = _json_lines(result.stdout)
     assert [event["type"] for event in events] == [
         "session",
+        "context",
         "thought",
         "command",
         "observation",
+        "context",
         "thought",
         "result",
     ]
     assert set(events[0]) == {"type", "session_id"}
-    assert events[2]["id"] == events[3]["id"]
-    assert events[2]["command"] == "printf hi > out.txt"
-    assert events[3]["returncode"] == 0
+    assert events[1]["step"] == 1
+    assert events[5]["step"] == 2
+    assert events[3]["id"] == events[4]["id"]
+    assert events[3]["command"] == "printf hi > out.txt"
+    assert events[4]["returncode"] == 0
     assert events[-1]["completed"] is True
     assert events[-1]["final_output"] == "Wrote out.txt."
     assert events[-1]["usage"] == {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
@@ -153,15 +190,18 @@ def test_agent_emit_collects_per_step_events(tmp_path):
 
     assert result["completed"] is True
     assert [event["type"] for event in events] == [
+        "context",
+        "context",
         "thought",
         "command",
         "observation",
+        "context",
         "thought",
     ]
-    assert events[0] == {"type": "thought", "step": 2, "text": "Writing file."}
-    assert events[1]["step"] == events[2]["step"] == 2
-    assert events[1]["id"] == events[2]["id"]
-    assert events[2]["returncode"] == 0
+    assert events[2] == {"type": "thought", "step": 2, "text": "Writing file."}
+    assert events[3]["step"] == events[4]["step"] == 2
+    assert events[3]["id"] == events[4]["id"]
+    assert events[4]["returncode"] == 0
     assert (tmp_path / "out.txt").read_text() == "hi"
 
 
@@ -190,3 +230,173 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     )
     with pytest.raises(RuntimeError, match="Step limit \\(1\\) exceeded"):
         agent.run("do not finish")
+
+    # With per-call usage reported (the context event's source values) and no
+    # emit, nothing is emitted, nothing raises, and the run behaves the same.
+    with_usage = Agent(
+        model=UsageModel(
+            (assistant("Working.", tool_calls=[tool_call(1, command="true")]), 4321),
+            (assistant("done"), 8765),
+        ),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=load_config()["templates"],
+        step_limit=3,
+        emit=None,
+    )
+    result = with_usage.run("finish with usage")
+
+    assert result["completed"] is True
+    assert result["n_steps"] == 2
+    assert result["usage"] == {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
+
+
+def test_context_event_per_model_call_reports_that_calls_usage(tmp_path):
+    events = []
+    agent = Agent(
+        model=UsageModel(
+            (assistant("First.", tool_calls=[tool_call(1, command="echo one")]), 111),
+            (assistant("Second.", tool_calls=[tool_call(2, command="echo two")]), 222),
+            (assistant("all done"), 333),
+        ),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=load_config()["templates"],
+        step_limit=5,
+        emit=events.append,
+    )
+
+    result = agent.run("two commands then done")
+
+    assert result["completed"] is True
+    assert [event["type"] for event in events] == [
+        "context", "thought", "command", "observation",
+        "context", "thought", "command", "observation",
+        "context", "thought",
+    ]
+    context_events = [event for event in events if event["type"] == "context"]
+    assert len(context_events) == 3
+    assert [(event["step"], event["prompt_tokens"]) for event in context_events] == [
+        (1, 111), (2, 222), (3, 333),
+    ]
+    for event in context_events:
+        assert set(event) == {"type", "step", "prompt_tokens", "context_window",
+                              "compact_threshold", "model"}
+        assert event["model"] == "openai/fake-model"
+
+
+def test_context_event_threshold_is_fraction_times_window_for_the_config_in_use(
+    tmp_path,
+):
+    compact = {
+        "context_window": 10000,
+        "threshold_fraction": 0.5,
+        "mask_keep_steps": 8,
+        "tail_budget_tokens": 24000,
+        "step_observation_budget_chars": 40000,
+    }
+    events = []
+    agent = Agent(
+        model=UsageModel((assistant("done"), 100)),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=load_config()["templates"],
+        step_limit=2,
+        emit=events.append,
+        compact=compact,
+    )
+
+    agent.run("finish")
+
+    event = [event for event in events if event["type"] == "context"][0]
+    assert event["context_window"] == 10000
+    assert event["compact_threshold"] == int(0.5 * 10000) == 5000
+
+
+def test_cli_context_window_flag_flows_into_the_context_event(
+    tmp_path, monkeypatch, task_file
+):
+    def query(self, messages, tools=None):
+        self.last_prompt_tokens = 118234
+        return assistant("done")
+
+    monkeypatch.setattr(Model, "query", query)
+
+    result = CliRunner().invoke(
+        _cli_app(),
+        [
+            "--task-file",
+            task_file("show context"),
+            "--json",
+            "--cwd",
+            str(tmp_path),
+            "--session-dir",
+            str(tmp_path / "sessions"),
+            "--context-window",
+            "262144",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    events = _json_lines(result.stdout)
+    context_events = [event for event in events if event["type"] == "context"]
+    assert len(context_events) == 1
+    event = context_events[0]
+    assert event["step"] == 1
+    assert event["prompt_tokens"] == 118234
+    assert event["context_window"] == 262144
+    assert event["compact_threshold"] == int(0.65 * 262144) == 170393
+    assert event["model"] == load_config()["model"]["model_name"]
+
+
+def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
+    s_summary = assistant("1. Progress: nothing yet. 5. Remaining: everything.")
+    s_done = assistant("finished after retry")
+    events = []
+    agent = Agent(
+        model=UsageModel(
+            (OVERFLOW, None),   # original call: over-window
+            (s_summary, 700),   # compaction summary call
+            (s_done, 900),      # retried conversation call
+        ),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=load_config()["templates"],
+        step_limit=3,
+        emit=events.append,
+    )
+
+    result = agent.run("overflow at the very first call")
+
+    assert result["completed"] is True
+    assert result["final_output"] == "finished after retry"
+    types = [event["type"] for event in events]
+    assert types.count("context") == 1
+    context_index = types.index("context")
+    event = events[context_index]
+    assert event["step"] == 1
+    assert event["prompt_tokens"] == 900
+    # The overflow compaction's compact event precedes the step's context event.
+    assert "compact" in types[:context_index]
+
+
+def test_context_event_without_usage_reports_null_prompt_tokens(tmp_path):
+    events = []
+    compact = load_config()["compact"]
+    agent = Agent(
+        model=UsageModel((assistant("done"), None)),
+        environment=Environment(cwd=str(tmp_path), timeout=10),
+        templates=load_config()["templates"],
+        step_limit=2,
+        emit=events.append,
+    )
+
+    result = agent.run("finish without usage")
+
+    assert result["completed"] is True
+    context_events = [event for event in events if event["type"] == "context"]
+    assert len(context_events) == 1
+    event = context_events[0]
+    assert event["prompt_tokens"] is None
+    assert event["step"] == 1
+    assert event["context_window"] == compact["context_window"]
+    assert event["compact_threshold"] == int(
+        compact["threshold_fraction"] * compact["context_window"]
+    )
+    assert event["model"] == "openai/fake-model"

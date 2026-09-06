@@ -21,6 +21,7 @@ class SlowModel:
     def __init__(self, delay, *replies):
         self._delay = delay
         self._replies = iter(replies)
+        self.model_name = "openai/fake-model"
         self.last_prompt_tokens = 0
 
     def query(self, messages, tools=None):

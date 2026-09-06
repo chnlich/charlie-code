@@ -498,6 +498,15 @@ class Agent:
                 self._check_wall()
                 self._maybe_compact(step_idx)
                 message, finish_reason = self._query_step(step_idx)
+                if self.emit:
+                    self.emit({
+                        "type": "context",
+                        "step": step_idx,
+                        "prompt_tokens": self.model.last_prompt_tokens,
+                        "context_window": self.compact["context_window"],
+                        "compact_threshold": self._threshold_tokens(),
+                        "model": self.model.model_name,
+                    })
                 self._append_message(message)
                 self._check_wall()
                 thought = strip_leaked_reasoning(message.get("content") or "").strip()
