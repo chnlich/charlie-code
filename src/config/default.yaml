@@ -35,7 +35,16 @@ environment:
   timeout: 60
 
 skills:
-  root: "~/.agents/skills"
+  # Host level, in precedence order; a missing directory is skipped. --skills-root or
+  # CHARLIE_CODE_SKILLS_ROOT (a single path) replaces this list for one run.
+  roots:
+    - "~/.agents/skills"
+    - "~/.claude/skills"
+  # Repo level, relative to the git worktree root that contains the working
+  # directory; scanned before the host roots, so a repo skill wins a name collision.
+  repo_dirs:
+    - ".claude/skills"
+    - ".agents/skills"
 
 session:
   dir: "~/.charlie-code/sessions"

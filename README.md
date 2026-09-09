@@ -69,6 +69,31 @@ file is silently skipped; a file that cannot be read or decoded as UTF-8
 produces one stderr warning naming the file, and the session continues without
 it. Resumed sessions replay the stored history and never re-read the file.
 
+### Skills
+
+On a **fresh** session start, charlie-code lists the skills it can find in the
+system message: one line per skill with its `name` and `description`, followed by
+the absolute path of its `SKILL.md`, so the model reads a skill's full text with
+`cat` only when a task calls for it. Two levels feed the list:
+
+- Host level: every `<root>/<name>/SKILL.md` under the configured roots, by default
+  `~/.agents/skills` (the Agent Skills convention shared with Codex and Gemini CLI)
+  and `~/.claude/skills` (Claude Code). `--skills-root DIR`, or the environment
+  variable `CHARLIE_CODE_SKILLS_ROOT`, names a single directory that replaces the
+  configured roots for that run.
+- Repo level: `.claude/skills/` and `.agents/skills/` under the git worktree root
+  that contains the working directory (`--cwd`), found as the first ancestor holding
+  a `.git` entry, directory or file. A working directory outside any repository has
+  no repo level.
+
+Repo-level directories are scanned first, then the host roots; the first directory
+that supplies a name wins, so a repo skill overrides a host skill of the same name,
+and a skill linked under the same name into both host roots lists once. A
+`SKILL.md` without frontmatter or without a `description` is skipped, as is a
+missing directory. The list is computed once at startup; resumed sessions replay
+their stored system message. The root and directory lists live under `skills:` in
+`src/config/default.yaml`.
+
 ### How a run ends
 
 The agent drives the endpoint's native tool calling: it offers exactly one tool,

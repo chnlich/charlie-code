@@ -15,7 +15,7 @@ import typer
 from agent import Agent, load_config
 from environment import Environment
 from model import Model
-from skills import load_skill_catalog
+from skills import find_repo_root, load_skill_catalog
 
 
 def _read_task(task_file):
@@ -81,7 +81,9 @@ def run(
         None, "--cwd", help="Repo directory the agent operates in (default: current dir)."
     ),
     skills_root: str = typer.Option(
-        None, "--skills-root", help="Agent Skills root directory override."
+        None,
+        "--skills-root",
+        help="Host-level Agent Skills root; replaces the configured roots for this run.",
     ),
     resume: str = typer.Option(None, "--resume", help="Resume a previous session id."),
     session_dir: str = typer.Option(
@@ -128,11 +130,17 @@ def run(
     )
     api_key = os.environ.get("CHARLIE_CODE_API_KEY", "EMPTY")
     working_dir = cwd or os.getcwd()
-    resolved_skills_root = (
-        skills_root
-        or os.environ.get("CHARLIE_CODE_SKILLS_ROOT")
-        or config["skills"]["root"]
+    # Skill roots, repo level first so a repo skill wins a name collision: the repo
+    # directories under the git worktree root that contains the working directory
+    # (none outside a repo), then the host roots. An explicit host root (flag, then
+    # environment variable) replaces the configured host root list for this run.
+    host_root_override = skills_root or os.environ.get("CHARLIE_CODE_SKILLS_ROOT")
+    host_roots = [host_root_override] if host_root_override else config["skills"]["roots"]
+    repo_root = find_repo_root(working_dir)
+    repo_skill_dirs = (
+        [str(repo_root / rel) for rel in config["skills"]["repo_dirs"]] if repo_root else []
     )
+    skill_roots = repo_skill_dirs + list(host_roots)
     resolved_session_dir = os.path.expanduser(
         session_dir
         or os.environ.get("CHARLIE_CODE_SESSION_DIR")
@@ -155,7 +163,7 @@ def run(
         templates=config["templates"],
         step_limit=step_limit,
         wall_seconds=wall_budget,
-        skills_catalog=load_skill_catalog(resolved_skills_root),
+        skills_catalog=load_skill_catalog(skill_roots),
         emit=_emit,
         state_file=state_file,
         resume=resume is not None,
