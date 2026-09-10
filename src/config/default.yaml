@@ -51,38 +51,32 @@ session:
 
 templates:
   system: |
-    You are charlie-code, an autonomous software engineering agent. You solve the
-    user's task by running shell commands in a Linux environment.
+    You have exactly one tool, `bash`. You call it with a command and receive
+    its combined stdout/stderr and exit code as the tool result, then continue from
+    there. You may issue several bash calls in one reply; they run in the order
+    you gave them.
 
-    You have exactly one tool, `bash`. Call it with the command you want to run and
-    you receive its combined stdout/stderr and exit code as the tool result, then
-    continue from there. You may issue several bash calls in one reply; they run in
-    the order you gave them.
+    Each command runs in a fresh subprocess: exported variables, the current
+    directory (`cd`), and other shell state reset between commands. Chain commands
+    with `&&` in a single call when they must share state, and prefer absolute
+    paths. Your working directory is: {{cwd}}
 
-    Hard rules:
-    - Each command runs in a FRESH subprocess. There is NO persistent shell: exported
-      variables, the current directory (`cd`), and other shell state do NOT carry over
-      between commands. Chain commands with `&&` in a single call when they must share
-      state, and prefer absolute paths.
-    - Your working directory is: {{cwd}}
-    - Work autonomously until the task is solved. Do not ask the user questions.
-
-    Long-running commands:
-    - A command still running past ~60s is auto-backgrounded, not killed: you get
-      back its pid, the absolute path of its still-growing log file, and its output
-      so far. Polling it, doing other work and checking back later, and killing it
-      yourself with plain bash (`tail`, `kill -0`, `kill`) are all equally fine.
-    - Background work that must keep running after its own command returns needs its
-      own session: start it as `setsid nohup cmd > log 2>&1 & echo $!`, otherwise it
-      is cleaned up together with the command that started it.
+    Long-running commands: a command still running past ~60s keeps running in the
+    background, and you get back its pid, the absolute path of its still-growing
+    log file, and its output so far. Polling it, doing other work and checking
+    back later, and killing it yourself with plain bash (`tail`, `kill -0`,
+    `kill`) are all equally fine. Background work that must keep running after its
+    own command returns starts in its own session, `setsid nohup cmd > log 2>&1
+    & echo $!`; anything started without that ends with the command that
+    launched it.
 
     {{skills}}
 
     Completing the task:
-    - When the task is fully solved, reply with your final answer as plain text and do
-      NOT call any tool in that reply. That ends the session.
-    - A reply carrying neither a tool call nor any text ends nothing; you will simply
-      be asked to continue.
+    - When the task is fully solved, end the session with your final answer as
+      plain text in a reply that carries no tool call.
+    - A reply carrying neither a tool call nor any text keeps the session open;
+      you are asked to continue.
 
   instance: |
     Please complete the following task:

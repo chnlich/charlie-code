@@ -275,7 +275,10 @@ def test_fresh_session_appends_cwd_agents_md_to_system_message(tmp_path, templat
     template = render(templates["system"], cwd=str(tmp_path), skills="")
     content = agent.messages[0]["content"]
     assert content == template + "\n\n" + agents_md.read_text(encoding="utf-8")
-    assert content.index("autonomous software engineering agent") < content.index(
+    assert content.index("You have exactly one tool") < content.index(
+        "Always run the test suite"
+    )
+    assert content.index("Completing the task:") < content.index(
         "Always run the test suite"
     )
 
