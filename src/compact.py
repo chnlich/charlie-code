@@ -9,9 +9,9 @@ Pure functions over the flat message list, used by agent.Agent:
 - Tail cutter for the summarize layer: whole steps, newest first, up to a budget;
   an assistant message and its tool messages are inseparable.
 
-Token estimates are chars // 4 throughout; the real usage.prompt_tokens from the
-endpoint stays the trigger anchor in the agent and estimates are only used for
-layer-to-layer decisions.
+Token estimates here use chars // 4. The agent anchors both the trigger and the
+post-mask estimate to the endpoint's measured usage.prompt_tokens, estimating only
+appended content and the masking delta. Rebuilt history gets a fresh estimate.
 """
 
 import json

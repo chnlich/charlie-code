@@ -159,6 +159,136 @@ def test_mask_is_idempotent():
     assert json.dumps(messages, sort_keys=True) == snapshot
 
 
+@pytest.mark.parametrize("old_output_chars, keep_steps, expected_layer", [
+    pytest.param(1000, 1, "summarize", id="insufficient-masking"),
+    pytest.param(8000, 1, "mask", id="effective-masking"),
+    pytest.param(1000, 2, "summarize", id="no-eligible-observations"),
+    pytest.param(0, 1, "summarize", id="placeholder-grows"),
+])
+def test_threshold_compaction_preserves_measured_token_calibration(
+    tmp_path, templates, old_output_chars, keep_steps, expected_layer
+):
+    s1 = assistant(tool_calls=[tool_call(1, command=_big_output(old_output_chars, "a"))])
+    s2 = assistant(tool_calls=[tool_call(2, command=_big_output(1000, "b"))],
+                   reasoning_content="Keep this reasoning in the verbatim tail.")
+    s3 = assistant(tool_calls=[tool_call(3, command="true")])
+    replies = [(s1, 100), (s2, 6000)]
+    if expected_layer == "summarize":
+        # The summary measures the old history; only the next regular call can
+        # measure the rebuilt history and anchor subsequent step boundaries.
+        replies.append((assistant("The earlier observation has been reviewed."), 6200))
+    replies.extend([(s3, 100), (assistant("finished"), 100)])
+    events = []
+    agent = _agent(tmp_path, templates, *replies, emit=events.append,
+                   compact=_compact(mask_keep_steps=keep_steps))
+
+    result = agent.run("review observations then finish")
+
+    compact_events = [e for e in events if e["type"] == "compact"]
+    assert [e["layer"] for e in compact_events] == [expected_layer]
+    event = compact_events[0]
+    assert event["step"] == 3
+    assert event["trigger"] == "threshold"
+    assert event["pre_tokens"] > 6000 > 2 * est_messages_tokens(agent.model.seen_prompts[1])
+    assert result["completed"] is True
+    assert result["final_output"] == "finished"
+
+    masked_history = agent.model.seen_prompts[2]
+    original_observation = agent.model.seen_prompts[1][-1]
+    if keep_steps == 1:
+        masked_observation = masked_history[3]
+        assert masked_observation["tool_call_id"] == original_observation["tool_call_id"]
+        assert masked_observation["content"].startswith(MASK_SENTINEL)
+        if old_output_chars == 0:
+            assert len(masked_observation["content"]) > len(original_observation["content"])
+    else:
+        assert masked_history[3] == original_observation
+        assert not any(m["content"].startswith(MASK_SENTINEL)
+                       for m in masked_history if m["role"] == "tool")
+
+    if expected_layer == "summarize":
+        assert [tools is None for tools in agent.model.seen_tools] == [
+            False, False, True, False, False,
+        ]
+        assert masked_history[-1] == {"role": "user", "content": templates["compact_prompt"]}
+        rebuilt_history = agent.model.seen_prompts[3]
+        assert [m["role"] for m in rebuilt_history] == [
+            "system", "user", "user", "assistant", "tool",
+        ]
+        assert event["post_tokens_est"] == est_messages_tokens(rebuilt_history)
+        assert event["post_tokens_est"] < 5000
+        assert rebuilt_history[-2:] == masked_history[-3:-1]
+    else:
+        assert all(tools is not None for tools in agent.model.seen_tools)
+        assert 5000 > event["post_tokens_est"] > est_messages_tokens(masked_history)
+        assert [m for m in agent.messages if m["role"] == "assistant"] == [
+            s1[0], s2[0], s3[0], assistant("finished")[0],
+        ]
+    assert s2[0] in agent.messages
+    assert any(m["role"] == "tool" and m["tool_call_id"] == "call-2"
+               and "b" * 1000 in m["content"] for m in agent.messages)
+    assert [e["prompt_tokens"] for e in events if e["type"] == "context"] == [
+        100, 6000, 100, 100,
+    ]
+
+
+def test_already_masked_observations_escalate_after_next_measurement(tmp_path, templates):
+    s1 = assistant(tool_calls=[tool_call(1, command=_big_output(8000, "a"))])
+    events = []
+    agent = _agent(tmp_path, templates,
+                   (s1, 4700), (assistant(""), 6000),
+                   (assistant("The observation has been reviewed."), 6100),
+                   (assistant("finished"), 100),
+                   emit=events.append, compact=_compact(mask_keep_steps=0))
+
+    result = agent.run("review one observation then finish")
+
+    compact_events = [e for e in events if e["type"] == "compact"]
+    assert [e["layer"] for e in compact_events] == ["mask", "summarize"]
+    assert [e["step"] for e in compact_events] == [2, 3]
+    assert compact_events[0]["post_tokens_est"] < 5000
+    assert compact_events[1]["pre_tokens"] > 6000
+    assert [tools is None for tools in agent.model.seen_tools] == [False, False, True, False]
+    after_first_mask = [m for m in agent.model.seen_prompts[1] if m["role"] == "tool"]
+    before_summary = [m for m in agent.model.seen_prompts[2] if m["role"] == "tool"]
+    assert len(after_first_mask) == 1
+    assert after_first_mask[0]["content"].startswith(MASK_SENTINEL)
+    assert before_summary == after_first_mask
+    assert result["completed"] is True
+    assert result["final_output"] == "finished"
+
+
+def test_mask_estimate_stays_nonnegative_when_character_savings_exceed_usage(
+    tmp_path, templates
+):
+    old_step = assistant(tool_calls=[tool_call(1, command="true")])
+    old_observation = {"role": "tool", "tool_call_id": "call-1",
+                       "content": "Exit code: 0\nOutput:\n" + "x" * 40000}
+    state_file = tmp_path / "session.json"
+    state_file.write_text(json.dumps({
+        "protocol": "tool-calls-v1",
+        "messages": [{"role": "system", "content": "system"},
+                     {"role": "user", "content": "task"},
+                     old_step[0], old_observation],
+    }))
+    events = []
+    new_step = assistant(tool_calls=[tool_call(2, command="true")])
+    agent = _agent(tmp_path, templates, (new_step, 6000), (assistant("finished"), 100),
+                   emit=events.append, state_file=str(state_file), resume=True)
+
+    result = agent.run("continue")
+
+    compact_events = [e for e in events if e["type"] == "compact"]
+    assert len(compact_events) == 1
+    assert compact_events[0]["layer"] == "mask"
+    assert compact_events[0]["pre_tokens"] > 6000
+    assert compact_events[0]["post_tokens_est"] == 0
+    assert all(tools is not None for tools in agent.model.seen_tools)
+    assert agent.model.seen_prompts[1][3]["content"].startswith(MASK_SENTINEL)
+    assert result["completed"] is True
+    assert result["final_output"] == "finished"
+
+
 # ---------------------------------------------------------------------------
 # Acceptance 2: when masking is insufficient the history is exactly
 # [system, task, summary, tail] with the tail in whole steps including the last.
@@ -242,6 +372,8 @@ def test_overflow_compacts_and_retries_once_then_completes(tmp_path, templates):
                                       "pre_tokens", "post_tokens_est"}
     assert compact_events[0]["trigger"] == "overflow"
     assert compact_events[0]["layer"] == "summarize"
+    assert compact_events[0]["pre_tokens"] == est_messages_tokens(agent.model.seen_prompts[0])
+    assert compact_events[0]["post_tokens_est"] == est_messages_tokens(agent.model.seen_prompts[2])
     assert [m["role"] for m in agent.messages] == ["system", "user", "user",
                                                    "assistant"]
 

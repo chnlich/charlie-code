@@ -395,17 +395,24 @@ class Agent:
         enough (or the endpoint already reported overflow), then persist and
         emit. Compaction rewrites self.messages in place; the state protocol is
         untouched."""
+        before_mask_est = est_messages_tokens(self.messages)
         if pre_tokens is None:
             estimate = self._anchored_estimate()
             pre_tokens = (estimate if estimate is not None
-                          else est_messages_tokens(self.messages))
+                          else before_mask_est)
 
         mask_old_observations(self.messages, self.compact["mask_keep_steps"])
+        # Keep measured token calibration: chars/4 estimates only the masking
+        # delta, since a fresh whole-history estimate can hide an overfull prompt.
+        post_tokens_est = max(
+            0, pre_tokens + est_messages_tokens(self.messages) - before_mask_est
+        )
         layer = "mask"
         if (trigger == "overflow"
-                or est_messages_tokens(self.messages) >= self._threshold_tokens()):
+                or post_tokens_est >= self._threshold_tokens()):
             self._summarize_layer(step_idx)
             layer = "summarize"
+            post_tokens_est = est_messages_tokens(self.messages)
 
         self._persist_messages()
         self._last_query_index = None
@@ -415,7 +422,7 @@ class Agent:
             "layer": layer,
             "trigger": trigger,
             "pre_tokens": int(pre_tokens),
-            "post_tokens_est": est_messages_tokens(self.messages),
+            "post_tokens_est": post_tokens_est,
         }
         if self.emit:
             self.emit(event)
