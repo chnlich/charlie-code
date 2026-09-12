@@ -22,9 +22,9 @@ agent:
 # Config invariant: mask_keep_steps x the per-step entry budget plus
 # tail_budget_tokens plus fixed overhead (system + task + summary) must leave
 # headroom under context_window. Defaults: 8 x ~10k tokens + 24k tail + ~1.2k
-# overhead ~= 105k tokens against a 131072 window (~26k headroom).
+# overhead ~= 105k tokens against a 262144 window (~157k headroom).
 compact:
-  context_window: 131072
+  context_window: 262144
   threshold_fraction: 0.65
   mask_keep_steps: 8
   tail_budget_tokens: 24000
