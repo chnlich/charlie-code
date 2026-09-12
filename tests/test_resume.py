@@ -7,7 +7,7 @@ import main as cli_main
 import pytest
 
 from agent import INTERRUPTED_TOOL_RESULT, STATE_PROTOCOL
-from conftest import assistant, tool_call
+from conftest import assistant, final_answer, tool_call
 from environment import Environment
 from model import Model
 
@@ -25,9 +25,9 @@ def _json_lines(output):
 def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch, task_file):
     responses = iter([
         assistant(tool_calls=[tool_call(1, command="printf 'turn-one-output\\n'")]),
-        assistant("Turn one complete."),
+        final_answer("Turn one complete."),
         assistant(tool_calls=[tool_call(1, command="printf 'turn-two-output\\n'")]),
-        assistant("Turn two complete."),
+        final_answer("Turn two complete."),
     ])
     captured_messages = []
 
@@ -150,7 +150,7 @@ def test_state_file_holds_the_turn_so_far_before_each_risky_step(
 
     responses = iter([
         assistant(tool_calls=[tool_call(1, command="printf 'one\\n'")]),
-        assistant("Done."),
+        final_answer("Done."),
     ])
 
     def query(self, messages, tools=None):
@@ -206,7 +206,7 @@ def test_resume_answers_dangling_tool_calls_before_the_new_task(
 
     def query(self, messages, tools=None):
         prompts.append([message.copy() for message in messages])
-        return assistant("Turn two complete.")
+        return final_answer("Turn two complete.")
 
     monkeypatch.setattr(Model, "query", query)
     monkeypatch.setattr(

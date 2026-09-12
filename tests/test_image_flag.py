@@ -18,7 +18,7 @@ from typer.testing import CliRunner
 
 import main as cli_main
 from agent import IMAGE_MIME, load_config, render
-from conftest import assistant
+from conftest import assistant, final_answer
 from model import Model
 
 
@@ -34,7 +34,7 @@ def _capture_model(monkeypatch):
 
     def query(self, messages, tools=None):
         seen.append([dict(message) for message in messages])
-        return assistant("task acknowledged")
+        return final_answer("task acknowledged")
 
     monkeypatch.setattr(Model, "query", query)
     monkeypatch.setattr(

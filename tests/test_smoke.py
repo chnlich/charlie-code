@@ -5,7 +5,7 @@ bash call, and a final text answer that does.
 """
 
 from agent import Agent, load_config
-from conftest import ScriptedModel, assistant, tool_call
+from conftest import ScriptedModel, assistant, final_answer, tool_call
 from environment import Environment
 
 
@@ -15,7 +15,7 @@ def test_loop_runs_tools_and_completes_on_a_text_reply(tmp_path):
             assistant(""),  # nothing said and nothing called: keeps going
             assistant("Creating the file.",
                       tool_calls=[tool_call(1, command="echo hi > out.txt")]),
-            assistant("Created out.txt with the text hi."),
+            final_answer("Created out.txt with the text hi."),
         ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
@@ -29,7 +29,7 @@ def test_loop_runs_tools_and_completes_on_a_text_reply(tmp_path):
     assert result["final_output"] == "Created out.txt with the text hi."
     assert (tmp_path / "out.txt").read_text() == "hi\n"
 
-    assert result["steps"][0]["note"] == "empty response"
+    assert result["steps"][0]["note"] == "unfinished reply"
     assert result["steps"][1]["command"] == "echo hi > out.txt"
     assert result["steps"][1]["returncode"] == 0
 

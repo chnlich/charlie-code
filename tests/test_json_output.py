@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 import main as cli_main
 from agent import Agent, load_config
-from conftest import ScriptedModel, assistant, tool_call
+from conftest import ScriptedModel, assistant, final_answer, tool_call
 from environment import Environment
 from model import Model
 
@@ -72,7 +72,7 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch, task_f
     _patch_model(
         monkeypatch,
         assistant("Writing file.", tool_calls=[tool_call(1, command="printf hi > out.txt")]),
-        assistant("Wrote out.txt."),
+        final_answer("Wrote out.txt."),
     )
 
     result = CliRunner().invoke(
@@ -178,7 +178,7 @@ def test_agent_emit_collects_per_step_events(tmp_path):
             assistant(""),
             assistant("Writing file.",
                       tool_calls=[tool_call(1, command="printf hi > out.txt")]),
-            assistant("Wrote out.txt."),
+            final_answer("Wrote out.txt."),
         ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
@@ -207,7 +207,7 @@ def test_agent_emit_collects_per_step_events(tmp_path):
 
 def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     success = Agent(
-        model=ScriptedModel(assistant("Nothing to do.")),
+        model=ScriptedModel(final_answer("Nothing to do.")),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
         step_limit=1,
@@ -236,7 +236,7 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     with_usage = Agent(
         model=UsageModel(
             (assistant("Working.", tool_calls=[tool_call(1, command="true")]), 4321),
-            (assistant("done"), 8765),
+            (final_answer("done"), 8765),
         ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
@@ -256,7 +256,7 @@ def test_context_event_per_model_call_reports_that_calls_usage(tmp_path):
         model=UsageModel(
             (assistant("First.", tool_calls=[tool_call(1, command="echo one")]), 111),
             (assistant("Second.", tool_calls=[tool_call(2, command="echo two")]), 222),
-            (assistant("all done"), 333),
+            (final_answer("all done"), 333),
         ),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
@@ -295,7 +295,7 @@ def test_context_event_threshold_is_fraction_times_window_for_the_config_in_use(
     }
     events = []
     agent = Agent(
-        model=UsageModel((assistant("done"), 100)),
+        model=UsageModel((final_answer("done"), 100)),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
         step_limit=2,
@@ -315,7 +315,7 @@ def test_cli_context_window_flag_flows_into_the_context_event(
 ):
     def query(self, messages, tools=None):
         self.last_prompt_tokens = 118234
-        return assistant("done")
+        return final_answer("done")
 
     monkeypatch.setattr(Model, "query", query)
 
@@ -348,7 +348,7 @@ def test_cli_context_window_flag_flows_into_the_context_event(
 
 def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
     s_summary = assistant("1. Progress: nothing yet. 5. Remaining: everything.")
-    s_done = assistant("finished after retry")
+    s_done = final_answer("finished after retry")
     events = []
     agent = Agent(
         model=UsageModel(
@@ -380,7 +380,7 @@ def test_context_event_without_usage_reports_null_prompt_tokens(tmp_path):
     events = []
     compact = load_config()["compact"]
     agent = Agent(
-        model=UsageModel((assistant("done"), None)),
+        model=UsageModel((final_answer("done"), None)),
         environment=Environment(cwd=str(tmp_path), timeout=10),
         templates=load_config()["templates"],
         step_limit=2,

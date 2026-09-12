@@ -109,16 +109,22 @@ their stored system message. The root and directory lists live under `skills:` i
 The agent drives the endpoint's native tool calling: it offers exactly one tool,
 `bash`, and reads the response envelope rather than parsing the model's prose.
 
-- **Completion is a whitelist.** The run ends only when a reply satisfies all three:
-  `finish_reason` is `stop`, it carries no tool calls, and its text is non-empty.
-  That text is the final answer. Any other combination continues or fails.
+- **Completion is a declaration.** The run ends when a reply carries no tool calls,
+  `finish_reason` is `stop`, and its last line is the completion sentinel
+  (`agent.completion_sentinel`, default `[[END OF FINAL ANSWER]]`) with an answer
+  standing above it. That answer, with the line removed, is the final output. The
+  line is the one thing the endpoint cannot produce by accident.
 - **Tool calls.** A reply carrying tool calls runs all of them in the order given,
   one tool result fed back per call, then the loop continues.
-- **Truncation.** `finish_reason: length` raises immediately. A reply cut off
-  mid-answer is shape-identical to a finished one, so only the envelope can tell
-  them apart, and guessing would silently accept a half-finished answer.
-- **Empty reply.** No tool call and no text ends nothing; a short reminder is
-  appended and the loop continues.
+- **Truncation.** `finish_reason: length` raises immediately. A generation stopped
+  by a sampled stop token instead reports `stop`, so it is shape-identical to a
+  finished reply on the wire; the sentinel separates them, because truncation only
+  ever loses characters and cannot append that line.
+- **Unfinished reply.** A reply with no tool call that does not end in the sentinel
+  ends nothing, whether it is empty, a half-sentence, or the bare sentinel with no
+  answer above it: a reminder naming the line is appended and the loop continues.
+  After `agent.unfinished_reply_limit` consecutive such replies (default 3) the run
+  raises; any reply carrying a tool call resets the count.
 - **Step limit.** The loop raises after `--steps` steps (default 1000) — it fails loud
   rather than silently stopping.
 - **Withheld output.** Command output containing a model's own structure markers is
@@ -195,7 +201,8 @@ pytest tests/
 ```
 
 The smoke test exercises the full loop and bash-block parsing with `model.query`
-monkeypatched to return canned responses (including the completion sentinel). It never
+monkeypatched to return canned responses, final answers carrying the completion
+sentinel. It never
 touches the network or the SGLang server.
 ## Manual live run
 

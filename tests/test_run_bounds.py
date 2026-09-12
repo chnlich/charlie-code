@@ -9,6 +9,7 @@ import typer
 from typer.testing import CliRunner
 
 import main as cli_main
+from conftest import final_answer
 from environment import Environment
 from model import Model
 
@@ -40,7 +41,7 @@ def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch, task_f
     created = _spy_environments(monkeypatch)
 
     def query(self, messages, tools=None):
-        return {"role": "assistant", "content": "Nothing to do."}, "stop"
+        return final_answer("Nothing to do.")
 
     monkeypatch.setattr(Model, "query", query)
 

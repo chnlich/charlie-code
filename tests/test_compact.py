@@ -21,7 +21,7 @@ from compact import (
     split_steps,
     verbatim_tail_span,
 )
-from conftest import assistant, tool_call
+from conftest import assistant, final_answer, tool_call
 from environment import Environment
 from litellm.exceptions import BadRequestError, ContextWindowExceededError
 from model import Model
@@ -104,7 +104,7 @@ def test_mask_pass_preserves_assistant_verbatim_and_pairing(tmp_path, templates)
     s2 = assistant(tool_calls=[tool_call(2, command=_big_output(1000, "b"))])
     s3 = assistant("working", tool_calls=[tool_call(3, command=_big_output(1000, "c"))],
                    reasoning_content="step-three thinking")
-    s4 = assistant("all done")
+    s4 = final_answer("all done")
     events = []
     agent = _agent(tmp_path, templates,
                    (s1, 100), (s2, 100), (s3, 4900), (s4, 100), emit=events.append)
@@ -177,7 +177,7 @@ def test_threshold_compaction_preserves_measured_token_calibration(
         # The summary measures the old history; only the next regular call can
         # measure the rebuilt history and anchor subsequent step boundaries.
         replies.append((assistant("The earlier observation has been reviewed."), 6200))
-    replies.extend([(s3, 100), (assistant("finished"), 100)])
+    replies.extend([(s3, 100), (final_answer("finished"), 100)])
     events = []
     agent = _agent(tmp_path, templates, *replies, emit=events.append,
                    compact=_compact(mask_keep_steps=keep_steps))
@@ -222,7 +222,7 @@ def test_threshold_compaction_preserves_measured_token_calibration(
         assert all(tools is not None for tools in agent.model.seen_tools)
         assert 5000 > event["post_tokens_est"] > est_messages_tokens(masked_history)
         assert [m for m in agent.messages if m["role"] == "assistant"] == [
-            s1[0], s2[0], s3[0], assistant("finished")[0],
+            s1[0], s2[0], s3[0], final_answer("finished")[0],
         ]
     assert s2[0] in agent.messages
     assert any(m["role"] == "tool" and m["tool_call_id"] == "call-2"
@@ -238,7 +238,7 @@ def test_already_masked_observations_escalate_after_next_measurement(tmp_path, t
     agent = _agent(tmp_path, templates,
                    (s1, 4700), (assistant(""), 6000),
                    (assistant("The observation has been reviewed."), 6100),
-                   (assistant("finished"), 100),
+                   (final_answer("finished"), 100),
                    emit=events.append, compact=_compact(mask_keep_steps=0))
 
     result = agent.run("review one observation then finish")
@@ -273,7 +273,7 @@ def test_mask_estimate_stays_nonnegative_when_character_savings_exceed_usage(
     }))
     events = []
     new_step = assistant(tool_calls=[tool_call(2, command="true")])
-    agent = _agent(tmp_path, templates, (new_step, 6000), (assistant("finished"), 100),
+    agent = _agent(tmp_path, templates, (new_step, 6000), (final_answer("finished"), 100),
                    emit=events.append, state_file=str(state_file), resume=True)
 
     result = agent.run("continue")
@@ -299,7 +299,7 @@ def test_summarize_rebuilds_history_when_masking_is_not_enough(tmp_path, templat
     s2 = assistant(tool_calls=[tool_call(2, command=_big_output(20000, "b"))])
     summary_text = "1. Progress: steps one and two done. 5. Remaining: finish."
     s_summary = assistant(summary_text)
-    s3 = assistant("wrapping up")
+    s3 = final_answer("wrapping up")
     events = []
     agent = _agent(tmp_path, templates,
                    (s1, 100), (s2, 4900), (s_summary, 100), (s3, 100),
@@ -355,7 +355,7 @@ def test_summarize_rebuilds_history_when_masking_is_not_enough(tmp_path, templat
 
 def test_overflow_compacts_and_retries_once_then_completes(tmp_path, templates):
     s_summary = assistant("1. Progress: nothing yet. 5. Remaining: everything.")
-    s_done = assistant("finished after retry")
+    s_done = final_answer("finished after retry")
     events = []
     agent = _agent(tmp_path, templates,
                    (OVERFLOW, None), (s_summary, 100), (s_done, 100),
@@ -392,7 +392,7 @@ def test_over_window_summary_drops_oldest_middle_half_and_retries(tmp_path, temp
     s2 = assistant(tool_calls=[tool_call(2, command=_big_output(2000, "b"))])
     s3 = assistant(tool_calls=[tool_call(3, command=_big_output(5000, "c"))])
     s_summary = assistant("1. Progress: summarized after dropping middle.")
-    s_done = assistant("recovered")
+    s_done = final_answer("recovered")
     agent = _agent(tmp_path, templates,
                    (s1, 100), (s2, 100), (s3, 100),
                    (OVERFLOW, None),   # original call at step 4
@@ -417,7 +417,7 @@ def test_over_window_summary_drops_oldest_middle_half_and_retries(tmp_path, temp
 def test_summary_carries_markers_once_retries_then_accepts(tmp_path, templates):
     s_dirty = assistant("look: <|open|> slipped in")
     s_clean = assistant("1. Progress: clean summary.")
-    s_done = assistant("done")
+    s_done = final_answer("done")
     agent = _agent(tmp_path, templates,
                    (OVERFLOW, None), (s_dirty, 100), (s_clean, 100), (s_done, 100))
 
@@ -454,7 +454,7 @@ def test_state_file_readable_after_compaction_and_agent_resume(tmp_path, templat
     s1 = assistant(tool_calls=[tool_call(1, command=_big_output(2000, "a"))])
     s2 = assistant(tool_calls=[tool_call(2, command=_big_output(20000, "b"))])
     s_summary = assistant("1. Progress: two steps summarized.")
-    s_done = assistant("turn one done")
+    s_done = final_answer("turn one done")
     state_file = tmp_path / "session.json"
     agent = _agent(tmp_path, templates,
                    (s1, 100), (s2, 4900), (s_summary, 100), (s_done, 100),
@@ -469,7 +469,7 @@ def test_state_file_readable_after_compaction_and_agent_resume(tmp_path, templat
     assert _load_state(state_file) == agent.messages
 
     # An Agent --resume on the compacted state continues the session.
-    resumed = _agent(tmp_path, templates, (assistant("turn two done"), 100),
+    resumed = _agent(tmp_path, templates, (final_answer("turn two done"), 100),
                      state_file=str(state_file), resume=True)
     result = resumed.run("turn two")
     assert result["completed"] is True
@@ -500,8 +500,8 @@ def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch, task_fil
         assistant(tool_calls=[tool_call(1, command=_big_output(2000, "a"))]),
         assistant(tool_calls=[tool_call(2, command=_big_output(20000, "b"))]),
         assistant("SUMMARY: steps one and two."),
-        assistant("turn one done"),
-        assistant("turn two done"),
+        final_answer("turn one done"),
+        final_answer("turn two done"),
     ])
     tokens = iter([100, 4900, 100, 100, 100])
     captured = []
@@ -564,7 +564,7 @@ def _cli_episode_with_window(runner, tmp_path, monkeypatch, window, task_file):
     replies = iter([
         assistant(tool_calls=[tool_call(1, command=_big_output(8000, "a"))]),
         assistant(tool_calls=[tool_call(2, command=_big_output(8000, "b"))]),
-        assistant("done"),
+        final_answer("done"),
     ])
     tokens = iter([100, 4100, 100])
 
@@ -642,7 +642,7 @@ def test_single_oversized_observation_is_truncated_head_note_tail(tmp_path, temp
     compact = _compact(context_window=10 ** 9,
                        step_observation_budget_chars=1000)
     s1 = assistant(tool_calls=[tool_call(1, command=command)])
-    agent = _agent(tmp_path, templates, (s1, 100), (assistant("done"), 100),
+    agent = _agent(tmp_path, templates, (s1, 100), (final_answer("done"), 100),
                    compact=compact)
 
     result = agent.run("one oversized observation")
@@ -665,7 +665,7 @@ def test_multi_call_step_over_budget_gets_note_replacements(tmp_path, templates)
     compact = _compact(context_window=10 ** 9,
                        step_observation_budget_chars=1000)
     s1 = assistant(tool_calls=calls)
-    agent = _agent(tmp_path, templates, (s1, 100), (assistant("done"), 100),
+    agent = _agent(tmp_path, templates, (s1, 100), (final_answer("done"), 100),
                    compact=compact)
 
     result = agent.run("four calls each under budget, aggregate over")
@@ -699,7 +699,7 @@ def test_marker_gate_runs_on_complete_output_before_any_budget(tmp_path, templat
     compact = _compact(context_window=10 ** 9,
                        step_observation_budget_chars=1000)
     s1 = assistant(tool_calls=[tool_call(1, command=command)])
-    agent = _agent(tmp_path, templates, (s1, 100), (assistant("done"), 100),
+    agent = _agent(tmp_path, templates, (s1, 100), (final_answer("done"), 100),
                    compact=compact)
 
     agent.run("oversized output carrying a marker")
