@@ -20,6 +20,7 @@ session state file atomically on each append: a process killed at any moment
 and resuming such a file first answers any tool call the kill left unanswered.
 """
 
+import base64
 import json
 import os
 import sys
@@ -45,6 +46,17 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
 # protocol carries no stamp, and resuming it would feed the model a history that
 # tells it to answer with fenced commands, so those sessions are refused outright.
 STATE_PROTOCOL = "tool-calls-v1"
+
+# Image suffixes a task message may carry as image parts, with the MIME type
+# each becomes in its data URL. main.py validates --image against these keys,
+# so the suffix whitelist and the parts' MIME types share one source of truth.
+IMAGE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
 
 BASH_TOOL = {
     "type": "function",
@@ -208,6 +220,7 @@ class Agent:
         state_file=None,
         resume=False,
         compact=None,
+        images=(),
     ):
         self.model = model
         self.environment = environment
@@ -219,6 +232,7 @@ class Agent:
         self.state_file = state_file
         self.resume = resume
         self.compact = compact if compact is not None else load_config()["compact"]
+        self.images = list(images)
         self.messages = []
         self._start_time = None
         # len(self.messages) at the last successful model query: messages after it
@@ -492,12 +506,35 @@ class Agent:
                 continue
             return text
 
+    def _task_message(self, task):
+        """The task user message: plain text, or text plus image parts.
+
+        With images attached, content becomes a parts list: the rendered
+        instance template first, then one image_url part per image in flag
+        order, each a base64 data URL. Each file is read here, at message-build
+        time; the CLI already validated existence, readability, suffix, and
+        size before the Agent existed. Without images the message stays
+        exactly the string-content form. Either way it persists verbatim:
+        compaction retires it like any other message, resume replays it
+        as-is.
+        """
+        text = render(self.templates["instance"], task=task)
+        if not self.images:
+            return {"role": "user", "content": text}
+        parts = [{"type": "text", "text": text}]
+        for path in self.images:
+            raw = Path(path).read_bytes()
+            mime = IMAGE_MIME[Path(path).suffix.lower().lstrip(".")]
+            encoded = base64.b64encode(raw).decode("ascii")
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{encoded}"},
+            })
+        return {"role": "user", "content": parts}
+
     def run(self, task):
         self.messages = self._initial_messages()
-        self._append_message({
-            "role": "user",
-            "content": render(self.templates["instance"], task=task),
-        })
+        self._append_message(self._task_message(task))
         self._start_time = time.monotonic()
         steps = []
         try:

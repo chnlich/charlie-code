@@ -12,7 +12,7 @@ from pathlib import Path
 
 import typer
 
-from agent import Agent, load_config
+from agent import Agent, IMAGE_MIME, load_config
 from environment import Environment
 from model import Model
 from skills import find_repo_root, load_skill_catalog
@@ -41,6 +41,52 @@ def _read_task(task_file):
     if not task.strip():
         raise typer.BadParameter(f"--task-file: {source} contains no task text")
     return task
+
+
+# --image contract: at most 4 images per task, each at most 4 MiB measured
+# on the raw file bytes, before any base64 encoding.
+IMAGE_COUNT_LIMIT = 4
+IMAGE_SIZE_LIMIT = 4 * 1024 * 1024
+
+
+def _validate_images(images):
+    """Fail fast on any --image violation, before any Agent construction.
+
+    Same "failure always names the flag" style as _read_task: every message
+    starts with "--image: " and names the concrete cause. Each file is read
+    once here to prove readability and measure its raw size; the agent reads
+    the (already validated) files again when it builds the message parts.
+    """
+    if len(images) > IMAGE_COUNT_LIMIT:
+        fifth = str(images[IMAGE_COUNT_LIMIT])
+        raise typer.BadParameter(
+            f"--image: at most {IMAGE_COUNT_LIMIT} images per task; the 5th "
+            f"occurrence ({fifth!r}) exceeds the count cap"
+        )
+    for path in images:
+        name = str(path)
+        if not path.exists():
+            raise typer.BadParameter(f"--image: {name!r} does not exist")
+        if not path.is_file():
+            raise typer.BadParameter(f"--image: {name!r} is not a file")
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise typer.BadParameter(
+                f"--image: cannot read {name!r}: {exc.strerror or exc}"
+            ) from None
+        suffix = path.suffix.lower().lstrip(".")
+        if suffix not in IMAGE_MIME:
+            raise typer.BadParameter(
+                f"--image: {name!r} has unsupported suffix {path.suffix!r}; "
+                f"expected one of {', '.join(IMAGE_MIME)}"
+            )
+        if len(raw) > IMAGE_SIZE_LIMIT:
+            raise typer.BadParameter(
+                f"--image: {name!r} is {len(raw)} bytes; the limit is "
+                f"{IMAGE_SIZE_LIMIT} bytes (4 MiB)"
+            )
+    return list(images)
 
 
 def _print_log_retention(environment):
@@ -72,6 +118,13 @@ def run(
         "--task-file",
         help="Read the task text from PATH. The file's full UTF-8 text is "
         "the task, verbatim; it never rides argv.",
+    ),
+    image: list[Path] = typer.Option(
+        [],
+        "--image",
+        help="Attach an image to the task message; repeat up to 4 times in "
+        "reference order. Each PATH must be a readable file with suffix "
+        "png/jpg/jpeg/gif/webp and at most 4 MiB.",
     ),
     model: str = typer.Option(None, "--model", help="litellm model id override."),
     api_base: str = typer.Option(
@@ -114,6 +167,7 @@ def run(
         _emit = None
 
     task = _read_task(task_file)
+    images = _validate_images(image)
     if context_window is not None and context_window < 1:
         raise typer.BadParameter("--context-window must be an integer >= 1.")
 
@@ -167,6 +221,7 @@ def run(
         emit=_emit,
         state_file=state_file,
         resume=resume is not None,
+        images=images,
         compact=config["compact"],
     )
 

@@ -35,11 +35,17 @@ pip install -e ".[dev]"   # also installs pytest for the smoke test
 ## Run
 
 ```bash
-charlie-code --task-file TASK.md [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--wall-seconds N]
+charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--wall-seconds N]
 ```
 
 - `--task-file PATH` (required) supplies the task text: the file's full UTF-8
   contents verbatim.
+- `--image PATH` (repeatable, up to 4) attaches an image to the task message:
+  each PATH must be a readable file whose suffix is one of `png`, `jpg`,
+  `jpeg`, `gif`, `webp`, and at most 4 MiB. The task message then carries the
+  rendered task text plus one base64 `image_url` part per image, in the order
+  given; with no `--image` the message is the plain-text form. Images persist
+  verbatim in the session history and resume unchanged.
 - `--cwd` is the repo the agent operates in (default: current directory).
 - `--steps` is the hard step limit (default: 1000). Exceeding it fails loudly.
 - `--wall-seconds` is the hard episode wall-clock budget in seconds (default: 3600).
