@@ -1,4 +1,4 @@
-"""CLI-level wiring for the unattended-run bounds: --wall-seconds, log-dir lifecycle,
+"""CLI-level wiring for the unattended-run bounds: log-dir lifecycle
 and the KeyboardInterrupt path sweeping the environment. No network is touched.
 """
 
@@ -34,27 +34,6 @@ def _spy_environments(monkeypatch):
 
     monkeypatch.setattr(Environment, "__init__", spy_init)
     return created
-
-
-def test_wall_seconds_flag_overrides_the_config_default(tmp_path, monkeypatch, task_file):
-    def query(self, messages, tools=None):
-        raise AssertionError("model must not be queried once the wall budget is already spent")
-
-    monkeypatch.setattr(Model, "query", query)
-
-    result = CliRunner().invoke(
-        _cli_app(),
-        [
-            "--task-file", task_file("do it"), "--json", "--cwd", str(tmp_path),
-            "--session-dir", str(tmp_path / "sessions"),
-            "--wall-seconds", "0",
-        ],
-    )
-
-    assert result.exit_code != 0
-    events = _json_lines(result.stdout)
-    assert events[-1]["type"] == "error"
-    assert "wall" in events[-1]["message"].lower()
 
 
 def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch, task_file):

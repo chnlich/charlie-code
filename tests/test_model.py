@@ -36,13 +36,15 @@ def test_query_passes_timeout_and_disables_litellms_own_retries(monkeypatch):
         raise TimeoutError("endpoint stalled")
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
-    model = Model(model_name="m", api_base="http://x/v1", api_key="k", model_timeout=7)
+    model = Model(model_name="m", api_base="http://x/v1", api_key="k", idle_seconds=7)
 
     with pytest.raises(TimeoutError):
         model.query([{"role": "user", "content": "hi"}])
 
     assert seen["timeout"] == 7
     assert seen["num_retries"] == 0
+    assert seen["stream"] is True
+    assert seen["stream_options"] == {"include_usage": True}
 
 
 def test_num_retries_zero_bounds_a_stalled_call_to_one_attempt(monkeypatch):
@@ -57,9 +59,9 @@ def test_num_retries_zero_bounds_a_stalled_call_to_one_attempt(monkeypatch):
         raise TimeoutError("endpoint stalled")
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
-    model_timeout = 0.1
+    idle_seconds = 0.1
     model = Model(model_name="m", api_base="http://x/v1", api_key="k",
-                  model_timeout=model_timeout)
+                  idle_seconds=idle_seconds)
 
     start = time.monotonic()
     with pytest.raises(TimeoutError):
@@ -67,7 +69,7 @@ def test_num_retries_zero_bounds_a_stalled_call_to_one_attempt(monkeypatch):
     elapsed = time.monotonic() - start
 
     # 1 attempt, not the 3 a hidden default max_retries=2 would cost.
-    assert elapsed < model_timeout * 2
+    assert elapsed < idle_seconds * 2
 
 
 def test_query_sends_no_request_side_reasoning_fields(monkeypatch):
@@ -81,7 +83,7 @@ def test_query_sends_no_request_side_reasoning_fields(monkeypatch):
         raise TimeoutError("endpoint stalled")
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
-    model = Model(model_name="m", api_base="http://x/v1", api_key="k", model_timeout=7)
+    model = Model(model_name="m", api_base="http://x/v1", api_key="k", idle_seconds=7)
 
     with pytest.raises(TimeoutError):
         model.query([{"role": "user", "content": "hi"}])

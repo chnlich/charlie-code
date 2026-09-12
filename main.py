@@ -143,9 +143,6 @@ def run(
         None, "--session-dir", help="Session state directory override."
     ),
     steps: int = typer.Option(None, "--steps", help="Hard step limit override."),
-    wall_seconds: int = typer.Option(
-        None, "--wall-seconds", help="Hard episode wall-clock budget override, in seconds."
-    ),
     context_window: int = typer.Option(
         None,
         "--context-window",
@@ -204,19 +201,17 @@ def run(
     session_id = resume or str(uuid.uuid4())
     state_file = os.path.join(resolved_session_dir, f"{session_id}.json")
     step_limit = steps if steps is not None else config["agent"]["step_limit"]
-    wall_budget = wall_seconds if wall_seconds is not None else config["agent"]["wall_seconds"]
 
     agent = Agent(
         model=Model(
             model_name=model_name,
             api_base=base_url,
             api_key=api_key,
-            model_timeout=config["model"]["model_timeout"],
+            idle_seconds=config["model"]["idle_seconds"],
         ),
         environment=Environment(cwd=working_dir, timeout=config["environment"]["timeout"]),
         templates=config["templates"],
         step_limit=step_limit,
-        wall_seconds=wall_budget,
         skills_catalog=load_skill_catalog(skill_roots),
         emit=_emit,
         state_file=state_file,

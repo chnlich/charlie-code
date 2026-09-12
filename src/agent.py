@@ -25,7 +25,6 @@ import json
 import os
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import yaml
@@ -214,7 +213,6 @@ class Agent:
         environment,
         templates,
         step_limit,
-        wall_seconds=3600,
         skills_catalog="",
         emit=None,
         state_file=None,
@@ -226,7 +224,6 @@ class Agent:
         self.environment = environment
         self.templates = templates
         self.step_limit = step_limit
-        self.wall_seconds = wall_seconds
         self.skills_catalog = skills_catalog
         self.emit = emit
         self.state_file = state_file
@@ -234,26 +231,10 @@ class Agent:
         self.compact = compact if compact is not None else load_config()["compact"]
         self.images = list(images)
         self.messages = []
-        self._start_time = None
         # len(self.messages) at the last successful model query: messages after it
         # are what the last measured prompt_tokens does not yet account for. None
         # right after a compaction, until the next query re-anchors the estimate.
         self._last_query_index = None
-
-    def _check_wall(self):
-        """Raise once elapsed run time exceeds the wall-clock budget.
-
-        Called at step top, right after `model.query` returns, and after each
-        single tool call inside `_run_tool_calls` -- a reply may carry several
-        calls, so the budget must also be enforced between them, not only at step
-        boundaries.
-        """
-        elapsed = time.monotonic() - self._start_time
-        if elapsed > self.wall_seconds:
-            raise RuntimeError(
-                f"Wall-clock budget ({self.wall_seconds}s) exceeded after "
-                f"{elapsed:.1f}s."
-            )
 
     def _initial_messages(self):
         """History before this turn's task message.
@@ -332,7 +313,6 @@ class Agent:
                                       "content": bounded})
                 records.append({"thought": step_thought, "command": None,
                                 "observation": bounded, "note": "invalid tool call"})
-                self._check_wall()
                 continue
 
             event_id = f"s-{step_idx}-{index}"
@@ -362,7 +342,6 @@ class Agent:
             records.append({"thought": step_thought, "command": command,
                             "observation": bounded,
                             "returncode": result["returncode"], "note": note})
-            self._check_wall()
         return records
 
     def _threshold_tokens(self):
@@ -535,11 +514,9 @@ class Agent:
     def run(self, task):
         self.messages = self._initial_messages()
         self._append_message(self._task_message(task))
-        self._start_time = time.monotonic()
         steps = []
         try:
             for step_idx in range(1, self.step_limit + 1):
-                self._check_wall()
                 self._maybe_compact(step_idx)
                 message, finish_reason = self._query_step(step_idx)
                 if self.emit:
@@ -552,7 +529,6 @@ class Agent:
                         "model": self.model.model_name,
                     })
                 self._append_message(message)
-                self._check_wall()
                 thought = strip_leaked_reasoning(message.get("content") or "").strip()
                 if self.emit and thought:
                     self.emit({"type": "thought", "step": step_idx, "text": thought})

@@ -5,11 +5,10 @@
 model:
   model_name: "openai/your-org/your-model"
   api_base: "https://YOUR_SGLANG_HOST/v1"
-  model_timeout: 1200
+  idle_seconds: 1200  # seconds without a streamed chunk before the call fails; a call that keeps producing has no time limit
 
 agent:
   step_limit: 1000
-  wall_seconds: 3600
 
 # Layered context compaction. Every observation entering history is bounded by the
 # per-step entry budget; at a step boundary whose measured prompt tokens (plus a
