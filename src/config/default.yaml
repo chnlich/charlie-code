@@ -5,7 +5,11 @@
 model:
   model_name: "openai/your-org/your-model"
   api_base: "https://YOUR_SGLANG_HOST/v1"
-  idle_seconds: 1200  # seconds without a streamed chunk before the call fails; a call that keeps producing has no time limit
+  # stream selects how the call is made; timeout_seconds is the budget passed to
+  # litellm as `timeout`: the silence bound between streamed chunks when
+  # streaming, the whole-call bound when not.
+  stream: true
+  timeout_seconds: 1200
 
 agent:
   step_limit: 1000

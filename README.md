@@ -35,7 +35,7 @@ pip install -e ".[dev]"   # also installs pytest for the smoke test
 ## Run
 
 ```bash
-charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL] [--cwd DIR] [--steps N]
+charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--stream|--no-stream] [--timeout-seconds N]
 ```
 
 - `--task-file PATH` (required) supplies the task text: the file's full UTF-8
@@ -48,6 +48,13 @@ charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL]
   verbatim in the session history and resume unchanged.
 - `--cwd` is the repo the agent operates in (default: current directory).
 - `--steps` is the hard step limit (default: 1000). Exceeding it fails loudly.
+- `--stream` / `--no-stream` selects how the model call is made (default: the
+  configured `model.stream`, streaming). Under streaming the call stays alive as
+  long as chunks keep arriving; under `--no-stream` the timeout becomes the
+  whole-call budget instead of the inter-chunk silence bound.
+- `--timeout-seconds N` is the model-call budget passed to litellm as `timeout`:
+  the silence bound between streamed chunks when streaming, the whole-call bound
+  otherwise (default: `model.timeout_seconds`, 1200).
 - Each run gets a session id and writes message history to
   `~/.charlie-code/sessions/<session_id>.json` by default.
 - Use `--resume <session_id>` to append a new task to an existing session history.
@@ -144,14 +151,16 @@ harness like CharlieBot:
 - **Escape hatch.** A command that daemonizes itself with `setsid` (a new session,
   hence a different process group) leaves harness jurisdiction by design — that is
   the supported way to start a real background service meant to outlive the run.
-- **The model call is streamed.** `model.idle_seconds` (default 1200) is the
-  number of seconds without a streamed chunk before the call fails with
-  `RuntimeError("model produced no output for ...s")`; it is passed to litellm as
-  `timeout`, which under streaming bounds the silence between chunks rather than
-  the whole call, together with `num_retries=0` (litellm's OpenAI-compatible
-  handler otherwise retries internally by default, tripling the worst-case cost
-  of a stalled endpoint). A run has no total-duration budget and ends only by
-  task completion, the step limit, model silence or an endpoint error, or a
+- **The model call is streamed by default.** `model.timeout_seconds` (default
+  1200) is passed to litellm as `timeout`, which under streaming bounds the
+  silence between chunks rather than the whole call: the call fails with
+  `RuntimeError("model produced no output for ...s")` after that many seconds
+  without a chunk, and a model that keeps producing is never cut off. With
+  `--no-stream` the same number becomes the whole-call budget. Either way it is
+  combined with `num_retries=0` (litellm's OpenAI-compatible handler otherwise
+  retries internally by default, tripling the worst-case cost of a stalled
+  endpoint). A run has no total-duration budget and ends only by task
+  completion, the step limit, model silence or an endpoint error, or a
   truncated generation (`finish_reason=length`).
 - **Log lifecycle.** A run's log directory is deleted when it completes normally;
   on any non-zero exit it is kept and its path is printed for forensics.
@@ -165,7 +174,8 @@ OpenAI-compatible SGLang endpoint, accessed through litellm:
 | ------------- | --------------------------------------------------- |
 | model         | `openai/your-org/your-model`                        |
 | api_base      | `https://YOUR_SGLANG_HOST/v1`                       |
-| idle_seconds  | 1200 (seconds of silence between streamed chunks before the call fails; no retries) |
+| stream        | `true` (stream the model call)                      |
+| timeout_seconds | 1200 (silence bound between streamed chunks, whole-call bound when not; no retries) |
 
 Override precedence is **CLI flag > environment variable > YAML default**:
 

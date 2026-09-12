@@ -148,6 +148,20 @@ def run(
         "--context-window",
         help="Compaction context-window override, in tokens, for this invocation.",
     ),
+    stream: bool | None = typer.Option(
+        None,
+        "--stream/--no-stream",
+        help="Stream the model call. Under streaming the timeout is the silence "
+        "bound between chunks, so a call that keeps producing is never cut off; "
+        "under --no-stream it is the whole-call budget. Default: model.stream "
+        "in the config (streaming).",
+    ),
+    timeout_seconds: int | None = typer.Option(
+        None,
+        "--timeout-seconds",
+        help="Model-call budget passed to litellm as `timeout`: the silence bound "
+        "between streamed chunks when streaming, the whole-call bound when not.",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -167,6 +181,11 @@ def run(
     images = _validate_images(image)
     if context_window is not None and context_window < 1:
         raise typer.BadParameter("--context-window must be an integer >= 1.")
+    if timeout_seconds is not None and timeout_seconds < 1:
+        raise typer.BadParameter(
+            f"--timeout-seconds must be a positive integer (seconds), "
+            f"got {timeout_seconds}."
+        )
 
     config = load_config()
     if context_window is not None:
@@ -180,6 +199,10 @@ def run(
         api_base or os.environ.get("CHARLIE_CODE_API_BASE") or config["model"]["api_base"]
     )
     api_key = os.environ.get("CHARLIE_CODE_API_KEY", "EMPTY")
+    if stream is None:
+        stream = config["model"]["stream"]
+    if timeout_seconds is None:
+        timeout_seconds = config["model"]["timeout_seconds"]
     working_dir = cwd or os.getcwd()
     # Skill roots, repo level first so a repo skill wins a name collision: the repo
     # directories under the git worktree root that contains the working directory
@@ -207,7 +230,8 @@ def run(
             model_name=model_name,
             api_base=base_url,
             api_key=api_key,
-            idle_seconds=config["model"]["idle_seconds"],
+            timeout_seconds=timeout_seconds,
+            stream=stream,
         ),
         environment=Environment(cwd=working_dir, timeout=config["environment"]["timeout"]),
         templates=config["templates"],
