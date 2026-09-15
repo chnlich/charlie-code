@@ -5,17 +5,20 @@ Each bash command runs in its own fresh subprocess, in its own process group
 instead of a pipe. There is no persistent shell, so shell state (cwd via `cd`,
 exported vars) does not carry over between commands.
 
-Process governance is two-tier:
-- A command that returns inside `timeout` has its own process group reaped right
-  away, on every normal return. This is what kills `cmd &` survivors that share
-  the command's group.
-- A command still running at `timeout` is DEMOTED, not killed: its group is
-  registered on `self.roster` and left alone until `sweep()` runs at the end of
-  the episode.
+A command runs in the foreground until it exits. While it runs, the executor
+reports progress: at each `progress_notices_seconds` tick it emits a
+`command_progress` event (the harness renders it as a chat note), and a command
+still running at `kill_after_seconds` is terminated: SIGTERM to its process
+group, SIGKILL after a short grace period if it is still there. The observation
+then carries the output so far plus a note naming the cap. There is no
+background demotion: a command either returns on its own or is terminated, so
+nothing outlives the call except what an explicit `setsid` detaches.
 
-A command that escapes both tiers via an explicit `setsid` (a new session, hence a
-different pgid) leaves harness jurisdiction by design -- that is the documented way
-to start a real background service meant to outlive the run.
+A command returning on its own has its process group reaped right away, which
+kills any `cmd &` survivors sharing the group. A command that escapes via an
+explicit `setsid` (a new session, hence a different pgid) leaves harness
+jurisdiction by design -- that is the documented way to start a real background
+service meant to outlive the run.
 
 Every command's full output is written to the run's session log directory, named
 s-<step>-<call>.log, and never deleted: compaction placeholders point at these
@@ -36,30 +39,57 @@ from pathlib import Path
 # before it detaches. This grace period gives it room to finish detaching first.
 _REAP_GRACE_SECONDS = 0.1
 
+# Time a terminated command gets between SIGTERM and SIGKILL: enough for a
+# compiler or test runner to flush its buffers, short enough that a hung command
+# costs seconds past the cap, not minutes. Same shape as the harness's own stop
+# path, which SIGTERMs charlie-code and SIGKILLs it 5 seconds later.
+_TERM_GRACE_SECONDS = 5
 
-def _killpg(pgid):
-    """SIGKILL a process group; a group with no living members is a silent no-op."""
+
+def _signal_group(pgid, sig):
+    """Send `sig` to a process group; a group with no living members is a silent no-op."""
     try:
-        os.killpg(pgid, signal.SIGKILL)
+        os.killpg(pgid, sig)
     except ProcessLookupError:
         pass
 
 
+def _duration_label(seconds):
+    """Whole minutes read as minutes ("15 min"); anything else stays in seconds."""
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60} min"
+    return f"{seconds:g} s"
+
+
 class Environment:
-    def __init__(self, cwd, timeout, log_dir):
+    def __init__(self, cwd, progress_notices_seconds, kill_after_seconds, log_dir,
+                 emit=None):
+        ticks = [*progress_notices_seconds, kill_after_seconds]
+        if any(earlier >= later for earlier, later in zip(ticks, ticks[1:])):
+            raise ValueError(
+                "progress_notices_seconds must increase and stay below "
+                f"kill_after_seconds, got {list(progress_notices_seconds)} and "
+                f"{kill_after_seconds}"
+            )
         self.cwd = cwd
-        self.timeout = timeout
+        self.progress_notices_seconds = list(progress_notices_seconds)
+        self.kill_after_seconds = kill_after_seconds
         # The run's session log directory, created by main.py. Command logs and
         # the texts compaction lifts out of history land here and stay.
         self.log_dir = str(log_dir)
-        self.roster = []
+        # Sink for command_progress events; Agent hands its own emit over so the
+        # progress of a command lands in the same stream as its command event.
+        self.emit = emit
+        # The Popen being waited on, so a signal handler can kill it mid-wait.
+        self._running = None
 
     def execute(self, command, step, call):
         """Run one bash command and return its combined output and exit code.
 
         The full output goes to <log_dir>/s-<step>-<call>.log and stays there
         after the run, so a compaction placeholder can name it as the way to
-        read the observation back.
+        read the observation back. A command still running at the cap is
+        terminated and its output gets the termination note appended.
         """
         log_path = os.path.join(self.log_dir, f"s-{step}-{call}.log")
 
@@ -74,36 +104,74 @@ class Environment:
                 stderr=subprocess.STDOUT,
             )
 
+        self._running = proc
         try:
-            returncode = proc.wait(timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            # start_new_session=True makes the command its own session and process
-            # group leader, so its pgid is always its own pid. `proc` itself is kept
-            # so sweep() can reap it through subprocess's own bookkeeping instead of
-            # a raw os.waitpid, which would otherwise leave it a zombie forever
-            # (we, not init, are its parent).
-            self.roster.append({
-                "pgid": proc.pid, "pid": proc.pid, "log_path": log_path, "proc": proc,
-            })
-            output = Path(log_path).read_text(errors="replace")
-            marker = (
-                f"\n[command timed out after {self.timeout}s: still running as "
-                f"pid {proc.pid}, log at {log_path}. It has been demoted to the "
-                f"background rather than killed. Polling it, doing other work and "
-                f"checking back later, and killing it yourself are all equally "
-                f"fine next steps.]"
+            killed = self._wait_reporting_progress(proc, step, call, log_path)
+        finally:
+            self._running = None
+
+        if not killed:
+            time.sleep(_REAP_GRACE_SECONDS)
+        # start_new_session=True makes the command its own process group leader,
+        # so its pgid is its pid. Reaping the group collects `cmd &` survivors.
+        _signal_group(proc.pid, signal.SIGKILL)
+
+        output = Path(log_path).read_text(errors="replace")
+        if killed:
+            output += (
+                f"\n[terminated after {_duration_label(self.kill_after_seconds)}: "
+                f"still running as pid {proc.pid}; output so far above; log: "
+                f"{log_path}. Foreground commands are for work expected within "
+                f"5 min; start longer work detached with setsid nohup and wait "
+                f"for it as your role prompt describes.]"
             )
-            return {"output": output + marker, "returncode": -1,
-                    "log_path": log_path}
+        return {"output": output, "returncode": proc.returncode, "log_path": log_path}
 
-        time.sleep(_REAP_GRACE_SECONDS)
-        _killpg(proc.pid)
-        return {"output": Path(log_path).read_text(errors="replace"),
-                "returncode": returncode, "log_path": log_path}
+    def _wait_reporting_progress(self, proc, step, call, log_path):
+        """Wait for `proc`, emitting a progress event at each notice tick.
 
-    def sweep(self):
-        """SIGKILL every registered process group. Call on every controlled exit."""
-        for job in self.roster:
-            _killpg(job["pgid"])
-            job["proc"].wait()
-        self.roster = []
+        Returns False when the command exited on its own, True when it was still
+        running at the cap and has been terminated.
+        """
+        event_id = f"s-{step}-{call}"
+        started = time.monotonic()
+        for notice in self.progress_notices_seconds:
+            if _exited_before(proc, started + notice):
+                return False
+            self._emit_progress(step, event_id, notice, proc.pid, log_path, killed=False)
+        if _exited_before(proc, started + self.kill_after_seconds):
+            return False
+        _signal_group(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _signal_group(proc.pid, signal.SIGKILL)
+            proc.wait()
+        self._emit_progress(step, event_id, self.kill_after_seconds, proc.pid, log_path,
+                            killed=True)
+        return True
+
+    def _emit_progress(self, step, event_id, elapsed_seconds, pid, log_path, killed):
+        if self.emit is None:
+            return
+        self.emit({"type": "command_progress", "step": step, "id": event_id,
+                   "elapsed_seconds": elapsed_seconds, "pid": pid, "log": log_path,
+                   "killed": killed})
+
+    def kill_running(self):
+        """SIGKILL the process group of the command being waited on, if any.
+
+        Meant for a signal handler: the interrupted wait in `execute` observes
+        the exit and returns, so no reaping happens here.
+        """
+        if self._running is not None:
+            _signal_group(self._running.pid, signal.SIGKILL)
+
+
+def _exited_before(proc, deadline):
+    """True when `proc` exits before the monotonic `deadline`."""
+    try:
+        proc.wait(timeout=max(deadline - time.monotonic(), 0))
+    except subprocess.TimeoutExpired:
+        return False
+    return True

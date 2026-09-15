@@ -32,8 +32,8 @@ def _agent(tmp_path, templates, *replies, step_limit=5, emit=None, state_file=No
            resume=False):
     return Agent(
         model=ScriptedModel(*replies),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=step_limit,
         emit=emit,

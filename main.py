@@ -7,6 +7,7 @@ import contextlib
 import datetime
 import json
 import os
+import signal
 import sys
 import uuid
 from pathlib import Path
@@ -92,6 +93,24 @@ def _validate_images(images):
 
 def _print_log_retention(environment):
     print(f"Command logs retained at: {environment.log_dir}", file=sys.stderr)
+
+
+def _install_sigterm_handler(agent):
+    """Make SIGTERM a controlled exit: kill the running command, save state, exit 143.
+
+    A harness stops charlie-code with SIGTERM and escalates to SIGKILL five
+    seconds later. Commands run in their own sessions, so the signal never
+    reaches them on its own; killing the current command's group here keeps a
+    stop from leaving work running, and persisting first keeps the session
+    file resumable. 143 is the conventional exit status of a SIGTERM death.
+    """
+
+    def handle(signum, frame):
+        agent.environment.kill_running()
+        agent._persist_messages()
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, handle)
 
 
 def _print_trajectory(result):
@@ -244,7 +263,8 @@ def run(
         ),
         environment=Environment(
             cwd=working_dir,
-            timeout=config["environment"]["timeout"],
+            progress_notices_seconds=config["environment"]["progress_notices_seconds"],
+            kill_after_seconds=config["environment"]["kill_after_seconds"],
             log_dir=log_dir,
         ),
         templates=config["templates"],
@@ -256,6 +276,7 @@ def run(
         images=images,
         compact=config["compact"],
     )
+    _install_sigterm_handler(agent)
 
     if json_output:
         _emit({"type": "session", "session_id": session_id})
@@ -263,7 +284,7 @@ def run(
             with contextlib.redirect_stdout(sys.stderr):
                 result = agent.run(task)
         except KeyboardInterrupt:
-            agent.environment.sweep()
+            agent.environment.kill_running()
             _print_log_retention(agent.environment)
             raise
         except RuntimeError as exc:
@@ -287,7 +308,7 @@ def run(
     try:
         result = agent.run(task)
     except KeyboardInterrupt:
-        agent.environment.sweep()
+        agent.environment.kill_running()
         _print_log_retention(agent.environment)
         raise
     except Exception as exc:

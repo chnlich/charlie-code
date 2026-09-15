@@ -92,8 +92,8 @@ def _agent(tmp_path, templates, *steps, compact=None, emit=None, state_file=None
            step_limit=20, resume=False, images=()):
     return Agent(
         model=CompactModel(*steps),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                                log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                                kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=step_limit,
         emit=emit,

@@ -314,8 +314,8 @@ def test_removed_agent_time_budget_is_rejected(tmp_path, templates):
     with pytest.raises(TypeError):
         Agent(
             model=ScriptedModel(),
-            environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+            environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
             templates=templates,
             step_limit=5,
             **{removed_kwarg: 0},
@@ -331,8 +331,8 @@ def test_a_slow_but_productive_run_finishes(tmp_path, templates):
     ]
     agent = Agent(
         model=SleepingModel(replies, 0.2),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=5,
     )

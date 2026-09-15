@@ -63,7 +63,12 @@ compact:
   step_observation_budget_chars: 40000
 
 environment:
-  timeout: 60
+  # Seconds after which a running command reports progress (a command_progress
+  # event, rendered by the harness as a chat note), and the cap after which a
+  # command still running is terminated: SIGTERM to its process group, SIGKILL
+  # five seconds later if needed. The notices increase and stay below the cap.
+  progress_notices_seconds: [60, 300]
+  kill_after_seconds: 900
 
 skills:
   # Host level, in precedence order; a missing directory is skipped. --skills-root or
@@ -92,14 +97,11 @@ templates:
     with `&&` in a single call when they must share state, and prefer absolute
     paths. Your working directory is: {{cwd}}
 
-    Long-running commands: a command still running past ~60s keeps running in the
-    background, and you get back its pid, the absolute path of its still-growing
-    log file, and its output so far. Polling it, doing other work and checking
-    back later, and killing it yourself with plain bash (`tail`, `kill -0`,
-    `kill`) are all equally fine. Background work that must keep running after its
-    own command returns starts in its own session, `setsid nohup cmd > log 2>&1
-    & echo $!`; anything started without that ends with the command that
-    launched it.
+    Long-running commands: a command runs in the foreground and returns when it exits; the tool waits for it and
+    reports progress to CharlieBot while it runs. A command still running after {{kill_after_minutes}} minutes is
+    terminated, and you get its output so far with a note saying so. Run a command in the foreground when you
+    expect it to finish within five minutes; start anything longer in its own session, `setsid nohup cmd > log
+    2>&1 & echo $!`, record its pid and log path, and wait for it as your role prompt describes.
 
     {{skills}}
 

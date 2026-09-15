@@ -32,6 +32,11 @@ pip install -e .          # runtime: litellm, pyyaml, typer
 pip install -e ".[dev]"   # also installs pytest for the smoke test
 ```
 
+A host that runs charlie-code from a non-editable `uv tool` install of this checkout
+picks up a merge only after a reinstall: `scripts/reinstall-tool.sh` fast-forwards the
+checkout to `origin/main`, reinstalls the tool and asserts the installed copy is the
+new code, failing loudly on any step.
+
 ## Run
 
 ```bash
@@ -144,16 +149,26 @@ Runs are bounded by progress, not elapsed time, for unattended use under a
 harness like CharlieBot:
 
 - **Command execution never blocks indefinitely.** Each command runs with its
-  stdout/stderr redirected to a per-command log file under a run-scoped temp
+  stdout/stderr redirected to a per-command log file under the run's session log
   directory (not a pipe), with `stdin` closed so interactive commands see EOF
-  immediately instead of hanging. A command returning inside `environment.timeout`
-  (default 60s) has its own process group reaped right away, which also cleans up
-  any `cmd &` survivors it spawned.
-- **A command still running at the timeout is demoted, not killed.** The
-  observation reports it is still running, its pid, and its log file's absolute
-  path, with neutral guidance: poll it, keep working and check back later, or kill
-  it yourself — all equally fine. Demoted jobs are tracked for the rest of the run
-  and SIGKILLed when it ends (success, step limit, model silence, or error).
+  immediately instead of hanging. The command runs in the foreground until it
+  exits; a command returning on its own has its process group reaped right
+  away, which also cleans up any `cmd &` survivors it spawned.
+- **A running command reports progress.** At each `environment.progress_notices_seconds`
+  tick (default 60 and 300 seconds) the `--json` stream carries a
+  `command_progress` event with the command's id, pid and log path, which a
+  harness renders as a chat note.
+- **A command still running at `environment.kill_after_seconds` is terminated.**
+  Its process group gets SIGTERM, then SIGKILL five seconds later if it is still
+  there (default cap 900 seconds). The observation carries the output so far,
+  the process's real exit code (-15 or -9), and a note naming the cap, the pid
+  and the log path; a final `command_progress` event with `killed: true` marks
+  the termination. The system prompt tells the model to run only work expected
+  within five minutes in the foreground and to detach anything longer.
+- **SIGTERM to charlie-code is a controlled exit.** The running command's process
+  group is SIGKILLed, the session state is persisted, and the process exits with
+  status 143, inside the five-second window a supervisor allows before it
+  escalates to SIGKILL.
 - **Escape hatch.** A command that daemonizes itself with `setsid` (a new session,
   hence a different process group) leaves harness jurisdiction by design — that is
   the supported way to start a real background service meant to outlive the run.

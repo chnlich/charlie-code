@@ -296,6 +296,9 @@ class Agent:
         self._unfinished_replies = 0
         self.skills_catalog = skills_catalog
         self.emit = emit
+        # The executor reports command progress into the same event stream.
+        if emit is not None:
+            self.environment.emit = emit
         self.state_file = state_file
         self.resume = resume
         self.compact = compact if compact is not None else load_config()["compact"]
@@ -336,6 +339,7 @@ class Agent:
             cwd=self.environment.cwd,
             skills=self.skills_catalog,
             completion_sentinel=self.completion_sentinel,
+            kill_after_minutes=f"{self.environment.kill_after_seconds / 60:g}",
         )
         agents_md = read_agents_md(self.environment.cwd)
         if agents_md:
@@ -805,4 +809,3 @@ class Agent:
             )
         finally:
             self._persist_messages()
-            self.environment.sweep()

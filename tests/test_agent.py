@@ -16,8 +16,8 @@ from environment import Environment
 def _agent(tmp_path, templates, *replies, step_limit=5, emit=None):
     return Agent(
         model=ScriptedModel(*replies),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=step_limit,
         emit=emit,
@@ -159,37 +159,45 @@ def test_step_limit_is_unchanged(tmp_path, templates):
         agent.run("never finish")
 
 
-def test_run_finally_sweeps_the_environment_on_success_and_on_failure(tmp_path, templates):
-    class SpyEnvironment(Environment):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.swept = False
-
-        def sweep(self):
-            self.swept = True
-            super().sweep()
-
-    ok_env = SpyEnvironment(cwd=str(tmp_path), timeout=10,
-                            log_dir=str(tmp_path))
-    Agent(
-        model=ScriptedModel(final_answer("done")),
-        environment=ok_env,
+def test_progress_event_reaches_emit_with_the_command_id(tmp_path, templates):
+    events = []
+    agent = Agent(
+        model=ScriptedModel(
+            assistant("Waiting.", tool_calls=[tool_call(1, command="sleep 1")]),
+            final_answer("done"),
+        ),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[0.2],
+                                kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
-        step_limit=1,
-    ).run("finish")
-    assert ok_env.swept is True
+        step_limit=3,
+        emit=events.append,
+    )
 
-    fail_env = SpyEnvironment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path))
-    failing_agent = Agent(
-        model=ScriptedModel(assistant(tool_calls=[tool_call(1, command="true")])),
-        environment=fail_env,
+    agent.run("wait a bit")
+
+    command = next(event for event in events if event["type"] == "command")
+    same_call = [event["type"] for event in events if event.get("id") == command["id"]]
+    assert same_call == ["command", "command_progress", "observation"]
+    progress = next(event for event in events if event["type"] == "command_progress")
+    assert progress["step"] == command["step"]
+    assert progress["elapsed_seconds"] == 0.2
+    assert progress["killed"] is False
+
+
+def test_system_message_names_the_kill_cap_in_minutes(tmp_path, templates):
+    agent = Agent(
+        model=ScriptedModel(final_answer("done")),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[60, 300],
+                                kill_after_seconds=900, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=1,
     )
-    with pytest.raises(RuntimeError, match=r"Step limit \(1\) exceeded"):
-        failing_agent.run("never finish")
-    assert fail_env.swept is True
+
+    agent.run("finish")
+
+    system = agent.messages[0]["content"]
+    assert "still running after 15 minutes is" in system
+    assert "{{kill_after_minutes}}" not in system
 
 
 def test_fresh_session_appends_cwd_agents_md_to_system_message(tmp_path, templates):
@@ -202,7 +210,9 @@ def test_fresh_session_appends_cwd_agents_md_to_system_message(tmp_path, templat
 
     agent.run("count")
 
-    template = render(templates["system"], cwd=str(tmp_path), skills="", completion_sentinel=load_config()["agent"]["completion_sentinel"])
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      completion_sentinel=load_config()["agent"]["completion_sentinel"],
+                      kill_after_minutes=f"{10 / 60:g}")
     content = agent.messages[0]["content"]
     assert content == template + "\n\n" + agents_md.read_text(encoding="utf-8")
     assert content.index("You have exactly one tool") < content.index(
@@ -214,7 +224,9 @@ def test_fresh_session_appends_cwd_agents_md_to_system_message(tmp_path, templat
 
 
 def test_fresh_session_skips_missing_or_blank_agents_md(tmp_path, templates):
-    template = render(templates["system"], cwd=str(tmp_path), skills="", completion_sentinel=load_config()["agent"]["completion_sentinel"])
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      completion_sentinel=load_config()["agent"]["completion_sentinel"],
+                      kill_after_minutes=f"{10 / 60:g}")
 
     agent = _agent(tmp_path, templates, final_answer("done"))
     agent.run("count")
@@ -239,6 +251,7 @@ def test_undecodable_agents_md_warns_on_stderr_and_session_continues(
     assert agent.messages[0]["content"] == render(
         templates["system"], cwd=str(tmp_path), skills="",
         completion_sentinel=load_config()["agent"]["completion_sentinel"],
+        kill_after_minutes=f"{10 / 60:g}",
     )
     err = capsys.readouterr().err
     assert "warning" in err
@@ -252,8 +265,8 @@ def test_resume_replays_stored_system_text_without_rereading_agents_md(
     state_file = tmp_path / "session.json"
     first = Agent(
         model=ScriptedModel(final_answer("done")),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=5,
         state_file=str(state_file),
@@ -265,8 +278,8 @@ def test_resume_replays_stored_system_text_without_rereading_agents_md(
     agents_md.write_text("changed convention\n", encoding="utf-8")
     resumed = Agent(
         model=ScriptedModel(final_answer("done again")),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=templates,
         step_limit=5,
         state_file=str(state_file),

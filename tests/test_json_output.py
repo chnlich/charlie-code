@@ -181,8 +181,8 @@ def test_agent_emit_collects_per_step_events(tmp_path):
                       tool_calls=[tool_call(1, command="printf hi > out.txt")]),
             final_answer("Wrote out.txt."),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=3,
         emit=events.append,
@@ -210,8 +210,8 @@ def test_agent_emit_collects_per_step_events(tmp_path):
 def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     success = Agent(
         model=ScriptedModel(final_answer("Nothing to do.")),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=1,
         emit=None,
@@ -226,8 +226,8 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
             assistant("No completion.",
                       tool_calls=[tool_call(1, command="echo not_done")]),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=1,
         emit=None,
@@ -242,8 +242,8 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
             (assistant("Working.", tool_calls=[tool_call(1, command="true")]), 4321),
             (final_answer("done"), 8765),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=3,
         emit=None,
@@ -263,8 +263,8 @@ def test_context_event_per_model_call_reports_that_calls_usage(tmp_path):
             (assistant("Second.", tool_calls=[tool_call(2, command="echo two")]), 222),
             (final_answer("all done"), 333),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=5,
         emit=events.append,
@@ -308,8 +308,8 @@ def test_context_event_threshold_is_fraction_times_window_for_the_config_in_use(
     events = []
     agent = Agent(
         model=UsageModel((final_answer("done"), 100)),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=2,
         emit=events.append,
@@ -365,8 +365,8 @@ def test_context_event_carries_the_cached_tokens_the_endpoint_reported(tmp_path)
     model.last_cached_tokens = 58880
     agent = Agent(
         model=model,
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                                log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                                kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=2,
         emit=events.append,
@@ -389,8 +389,8 @@ def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
             (s_summary, 700),   # compaction summary call
             (s_done, 900),      # retried conversation call
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=3,
         emit=events.append,
@@ -415,8 +415,8 @@ def test_context_event_without_usage_reports_null_prompt_tokens(tmp_path):
     compact = load_config()["compact"]
     agent = Agent(
         model=UsageModel((final_answer("done"), None)),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=2,
         emit=events.append,

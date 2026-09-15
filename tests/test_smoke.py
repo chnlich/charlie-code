@@ -17,8 +17,8 @@ def test_loop_runs_tools_and_completes_on_a_text_reply(tmp_path):
                       tool_calls=[tool_call(1, command="echo hi > out.txt")]),
             final_answer("Created out.txt with the text hi."),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10,
-                              log_dir=str(tmp_path)),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                              kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=5,
     )
