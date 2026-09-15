@@ -8,6 +8,11 @@
 # code: the reinstalled entry point runs, and its own interpreter imports an
 # Environment that has kill_running and no sweep. Any failing step exits
 # non-zero; a checkout that cannot fast-forward stops here for a human.
+#
+# The reinstall goes through `uv tool upgrade`, which reads the existing
+# install's receipt: the same source directory and the same dependency
+# constraints the operator installed with, so a reinstall changes only this
+# repository's own code and never re-resolves the dependency set.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +21,7 @@ cd "$repo_root"
 git fetch origin
 git merge --ff-only origin/main
 
-uv tool install --reinstall "$repo_root"
+uv tool upgrade --reinstall charlie-code
 
 charlie-code --help > /dev/null
 

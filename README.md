@@ -34,8 +34,9 @@ pip install -e ".[dev]"   # also installs pytest for the smoke test
 
 A host that runs charlie-code from a non-editable `uv tool` install of this checkout
 picks up a merge only after a reinstall: `scripts/reinstall-tool.sh` fast-forwards the
-checkout to `origin/main`, reinstalls the tool and asserts the installed copy is the
-new code, failing loudly on any step.
+checkout to `origin/main`, reinstalls the tool through `uv tool upgrade` (keeping the
+install's recorded dependency constraints) and asserts the installed copy is the new
+code, failing loudly on any step.
 
 ## Run
 
