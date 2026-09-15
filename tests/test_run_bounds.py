@@ -37,7 +37,9 @@ def _spy_environments(monkeypatch):
     return created
 
 
-def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch, task_file):
+def test_session_log_dir_is_kept_after_a_successful_run(tmp_path, monkeypatch, task_file):
+    """Command logs are never deleted: compaction placeholders point at them,
+    so a clean exit retains the run's directory like a failed one does."""
     created = _spy_environments(monkeypatch)
 
     def query(self, messages, tools=None):
@@ -53,7 +55,7 @@ def test_log_dir_is_removed_after_a_successful_run(tmp_path, monkeypatch, task_f
 
     assert result.exit_code == 0, result.output
     assert len(created) == 1
-    assert not os.path.exists(created[0].log_dir)
+    assert os.path.exists(created[0].log_dir)
 
 
 def _raise_model_exploded(self, messages, tools=None):

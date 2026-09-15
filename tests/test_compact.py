@@ -1,10 +1,11 @@
-"""Layered context compaction: entry budget, mask layer, summarize layer,
+"""The compaction ladder: entry budget, the four levels, the target line,
 over-window fallback, persistence, and the compact event. All offline: the model
 is a scripted stand-in injecting usage values and over-window errors.
 """
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 import typer
@@ -13,9 +14,14 @@ from typer.testing import CliRunner
 import main as cli_main
 from agent import Agent, _load_state, load_config
 from compact import (
+    COMMAND_ELISION_MARKER,
+    ELISION_NOTE,
     MASK_SENTINEL,
     bound_observation,
+    drop_old_reasoning,
     drop_oldest_middle_half,
+    elide_old_commands,
+    est_message_chars,
     est_messages_tokens,
     mask_old_observations,
     split_steps,
@@ -42,6 +48,7 @@ class CompactModel:
         self._steps = list(steps)
         self.model_name = "openai/fake-model"
         self.last_prompt_tokens = None
+        self.last_cached_tokens = 0
         self.seen_tools = []
         self.seen_prompts = []
 
@@ -67,9 +74,14 @@ class CompactModel:
 def _compact(**overrides):
     cfg = {
         "context_window": 10000,
-        "threshold_fraction": 0.5,  # threshold: 5000 tokens
-        "mask_keep_steps": 1,
+        "threshold_fraction": 0.5,  # threshold line: 5000 tokens
+        "target_fraction": 0.5,     # target line: 5000 tokens (floor is lower)
+        "min_gain_tokens": 0,
+        "image_tokens": 1600,
+        "ladder": ["mask", "reasoning", "command", "summarize"],
+        "keep_tail_tokens": 300,
         "tail_budget_tokens": 300,  # 1200 chars
+        "command_head_chars": 200,
         "step_observation_budget_chars": 40000,
     }
     cfg.update(overrides)
@@ -77,15 +89,17 @@ def _compact(**overrides):
 
 
 def _agent(tmp_path, templates, *steps, compact=None, emit=None, state_file=None,
-           step_limit=20, resume=False):
+           step_limit=20, resume=False, images=()):
     return Agent(
         model=CompactModel(*steps),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                                log_dir=str(tmp_path)),
         templates=templates,
         step_limit=step_limit,
         emit=emit,
         state_file=state_file,
         resume=resume,
+        images=images,
         compact=compact if compact is not None else _compact(),
     )
 
@@ -95,7 +109,7 @@ def _big_output(chars, letter):
 
 
 # ---------------------------------------------------------------------------
-# Acceptance 1: threshold-triggered mask pass keeps assistant messages
+# Acceptance 1: a threshold-triggered ladder pass keeps assistant messages
 # byte-identical, tool_call_id pairing complete, old observations placeholders.
 # ---------------------------------------------------------------------------
 
@@ -119,25 +133,34 @@ def test_mask_pass_preserves_assistant_verbatim_and_pairing(tmp_path, templates)
     tool_messages = [m for m in agent.messages if m["role"] == "tool"]
     expected_ids = [c["id"] for s in (s1, s2, s3) for c in s[0]["tool_calls"]]
     assert [m["tool_call_id"] for m in tool_messages] == expected_ids
-    # Old observations (outside mask_keep_steps=1) are placeholders keeping the
-    # exit code and the original length; the newest step stays verbatim.
+    # Old observations (outside the verbatim tail) are placeholders keeping the
+    # exit code, the original length, and the log file; the newest step stays
+    # verbatim.
     for masked in tool_messages[:2]:
         assert masked["content"].startswith(MASK_SENTINEL)
         assert "exit code was 0" in masked["content"]
         assert re.search(r"original was \d{4} chars", masked["content"])
+        assert "Full text:" in masked["content"]
     assert "c" * 200 in tool_messages[2]["content"]
     assert not tool_messages[2]["content"].startswith(MASK_SENTINEL)
-    # Masking alone brought the estimate under the threshold: no summarize.
+    # Masking alone brought the estimate under the target line: no deeper level.
     compact_events = [e for e in events if e["type"] == "compact"]
     assert len(compact_events) == 1
     event = compact_events[0]
-    assert set(event) == {"type", "step", "layer", "trigger", "pre_tokens",
-                          "post_tokens_est"}
+    assert set(event) == {"type", "step", "layers", "layer", "trigger",
+                          "pre_tokens", "post_tokens_est", "target_tokens",
+                          "floor_tokens", "steps_since_last_compact",
+                          "invalidated_from_index"}
     assert event["step"] == 4
+    assert event["layers"] == ["mask"]
     assert event["layer"] == "mask"
     assert event["trigger"] == "threshold"
     assert event["pre_tokens"] >= 5000
     assert 0 < event["post_tokens_est"] < event["pre_tokens"]
+    assert event["target_tokens"] == 5000
+    assert event["floor_tokens"] > 0
+    assert event["steps_since_last_compact"] == 4
+    assert event["invalidated_from_index"] == 3
 
 
 def test_mask_is_idempotent():
@@ -150,23 +173,25 @@ def test_mask_is_idempotent():
         messages.append({"role": "tool", "tool_call_id": f"call-{index}",
                          "content": f"Exit code: 0\nOutput:\n{'x' * 500}"})
 
-    first = mask_old_observations(messages, keep_steps=1)
+    log_paths = {f"call-{index}": f"/logs/s-{index}-1.log" for index in range(4)}
+    tail_start, _ = verbatim_tail_span(messages, tail_budget_tokens=300)
+    first = mask_old_observations(messages, tail_start, log_paths)
     snapshot = json.dumps(messages, sort_keys=True)
-    second = mask_old_observations(messages, keep_steps=1)
+    second = mask_old_observations(messages, tail_start, log_paths)
 
-    assert first == 3
+    assert first > 0
     assert second == 0
     assert json.dumps(messages, sort_keys=True) == snapshot
 
 
-@pytest.mark.parametrize("old_output_chars, keep_steps, expected_layer", [
-    pytest.param(1000, 1, "summarize", id="insufficient-masking"),
-    pytest.param(8000, 1, "mask", id="effective-masking"),
-    pytest.param(1000, 2, "summarize", id="no-eligible-observations"),
-    pytest.param(0, 1, "summarize", id="placeholder-grows"),
+@pytest.mark.parametrize("old_output_chars, keep_tail_tokens, expected_layer", [
+    pytest.param(1000, 300, "summarize", id="insufficient-masking"),
+    pytest.param(8000, 300, "mask", id="effective-masking"),
+    pytest.param(1000, 4000, "summarize", id="no-eligible-observations"),
+    pytest.param(0, 300, "summarize", id="short-observation-not-masked"),
 ])
 def test_threshold_compaction_preserves_measured_token_calibration(
-    tmp_path, templates, old_output_chars, keep_steps, expected_layer
+    tmp_path, templates, old_output_chars, keep_tail_tokens, expected_layer
 ):
     s1 = assistant(tool_calls=[tool_call(1, command=_big_output(old_output_chars, "a"))])
     s2 = assistant(tool_calls=[tool_call(2, command=_big_output(1000, "b"))],
@@ -180,7 +205,7 @@ def test_threshold_compaction_preserves_measured_token_calibration(
     replies.extend([(s3, 100), (final_answer("finished"), 100)])
     events = []
     agent = _agent(tmp_path, templates, *replies, emit=events.append,
-                   compact=_compact(mask_keep_steps=keep_steps))
+                   compact=_compact(keep_tail_tokens=keep_tail_tokens))
 
     result = agent.run("review observations then finish")
 
@@ -195,12 +220,16 @@ def test_threshold_compaction_preserves_measured_token_calibration(
 
     masked_history = agent.model.seen_prompts[2]
     original_observation = agent.model.seen_prompts[1][-1]
-    if keep_steps == 1:
+    if keep_tail_tokens == 300:
         masked_observation = masked_history[3]
         assert masked_observation["tool_call_id"] == original_observation["tool_call_id"]
-        assert masked_observation["content"].startswith(MASK_SENTINEL)
         if old_output_chars == 0:
-            assert len(masked_observation["content"]) > len(original_observation["content"])
+            # A placeholder is longer than a near-empty observation, and masking
+            # would grow the history, so the short observation is left as-is.
+            assert masked_observation["content"] == original_observation["content"]
+            assert not masked_observation["content"].startswith(MASK_SENTINEL)
+        else:
+            assert masked_observation["content"].startswith(MASK_SENTINEL)
     else:
         assert masked_history[3] == original_observation
         assert not any(m["content"].startswith(MASK_SENTINEL)
@@ -236,21 +265,24 @@ def test_already_masked_observations_escalate_after_next_measurement(tmp_path, t
     s1 = assistant(tool_calls=[tool_call(1, command=_big_output(8000, "a"))])
     events = []
     agent = _agent(tmp_path, templates,
-                   (s1, 4700), (assistant(""), 6000),
-                   (assistant("The observation has been reviewed."), 6100),
+                   (s1, 100), (assistant(""), 6000),
+                   (assistant("working on"), 6100),
+                   (assistant("The observation has been reviewed."), 100),
                    (final_answer("finished"), 100),
-                   emit=events.append, compact=_compact(mask_keep_steps=0))
+                   emit=events.append, compact=_compact(keep_tail_tokens=0))
 
     result = agent.run("review one observation then finish")
 
     compact_events = [e for e in events if e["type"] == "compact"]
     assert [e["layer"] for e in compact_events] == ["mask", "summarize"]
-    assert [e["step"] for e in compact_events] == [2, 3]
+    assert [e["step"] for e in compact_events] == [3, 4]
     assert compact_events[0]["post_tokens_est"] < 5000
     assert compact_events[1]["pre_tokens"] > 6000
-    assert [tools is None for tools in agent.model.seen_tools] == [False, False, True, False]
-    after_first_mask = [m for m in agent.model.seen_prompts[1] if m["role"] == "tool"]
-    before_summary = [m for m in agent.model.seen_prompts[2] if m["role"] == "tool"]
+    assert [tools is None for tools in agent.model.seen_tools] == [
+        False, False, False, True, False,
+    ]
+    after_first_mask = [m for m in agent.model.seen_prompts[2] if m["role"] == "tool"]
+    before_summary = [m for m in agent.model.seen_prompts[3] if m["role"] == "tool"]
     assert len(after_first_mask) == 1
     assert after_first_mask[0]["content"].startswith(MASK_SENTINEL)
     assert before_summary == after_first_mask
@@ -261,37 +293,249 @@ def test_already_masked_observations_escalate_after_next_measurement(tmp_path, t
 def test_mask_estimate_stays_nonnegative_when_character_savings_exceed_usage(
     tmp_path, templates
 ):
-    old_step = assistant(tool_calls=[tool_call(1, command="true")])
-    old_observation = {"role": "tool", "tool_call_id": "call-1",
-                       "content": "Exit code: 0\nOutput:\n" + "x" * 40000}
-    state_file = tmp_path / "session.json"
-    state_file.write_text(json.dumps({
-        "protocol": "tool-calls-v1",
-        "messages": [{"role": "system", "content": "system"},
-                     {"role": "user", "content": "task"},
-                     old_step[0], old_observation],
-    }))
+    big_step = assistant(tool_calls=[tool_call(1, command=_big_output(40000, "x"))])
+    small_step = assistant(tool_calls=[tool_call(2, command="true")])
     events = []
-    new_step = assistant(tool_calls=[tool_call(2, command="true")])
-    agent = _agent(tmp_path, templates, (new_step, 6000), (final_answer("finished"), 100),
-                   emit=events.append, state_file=str(state_file), resume=True)
+    agent = _agent(tmp_path, templates,
+                   (big_step, 100), (small_step, 4990), (final_answer("finished"), 100),
+                   emit=events.append)
 
-    result = agent.run("continue")
+    result = agent.run("one huge observation then finish")
 
     compact_events = [e for e in events if e["type"] == "compact"]
-    assert len(compact_events) == 1
-    assert compact_events[0]["layer"] == "mask"
-    assert compact_events[0]["pre_tokens"] > 6000
-    assert compact_events[0]["post_tokens_est"] == 0
+    assert [e["step"] for e in compact_events] == [2, 3]
+    # First pass: the only span is the tail, so nothing is eligible and the
+    # estimate falls back to the bare measured anchor.
+    assert compact_events[0]["layers"] == ["mask"]
+    assert compact_events[0]["post_tokens_est"] == 100
+    # Second pass: masking the huge observation frees far more characters than
+    # the measured prompt tokens account for; the anchored estimate floors at 0.
+    assert compact_events[1]["layers"] == ["mask"]
+    assert compact_events[1]["pre_tokens"] >= 5000
+    assert compact_events[1]["post_tokens_est"] == 0
     assert all(tools is not None for tools in agent.model.seen_tools)
-    assert agent.model.seen_prompts[1][3]["content"].startswith(MASK_SENTINEL)
+    assert agent.model.seen_prompts[2][3]["content"].startswith(MASK_SENTINEL)
     assert result["completed"] is True
     assert result["final_output"] == "finished"
 
 
 # ---------------------------------------------------------------------------
-# Acceptance 2: when masking is insufficient the history is exactly
-# [system, task, summary, tail] with the tail in whole steps including the last.
+# The ladder: stops at the target line; escalates level by level; the summarize
+# level backstops; pairing and the non-arguments tool_calls fields survive.
+# ---------------------------------------------------------------------------
+
+def test_ladder_stops_at_the_target_line(tmp_path, templates):
+    """One compaction buys tens of steps: the ladder stops once the estimate is
+    at or below the target line, and the levels it never reached leave no
+    trace on the history."""
+    s1 = assistant(tool_calls=[tool_call(1, command=_big_output(20000, "a"))],
+                   reasoning_content="step-one thinking")
+    s2 = assistant(tool_calls=[tool_call(2, command=_big_output(1000, "b"))])
+    events = []
+    agent = _agent(tmp_path, templates,
+                   (s1, 100), (s2, 6000), (final_answer("done"), 100),
+                   emit=events.append,
+                   compact=_compact(target_fraction=0.3, min_gain_tokens=3000))
+
+    result = agent.run("compact down to thirty percent")
+
+    compact_events = [e for e in events if e["type"] == "compact"]
+    assert len(compact_events) == 1
+    event = compact_events[0]
+    assert event["layers"] == ["mask"]
+    assert event["layer"] == "mask"
+    assert event["target_tokens"] == 3000
+    assert event["floor_tokens"] < event["target_tokens"]
+    assert event["post_tokens_est"] <= event["target_tokens"]
+    assert event["post_tokens_est"] < event["pre_tokens"]
+    # The levels the ladder never reached left no trace.
+    stored = [m for m in agent.messages if m["role"] == "assistant"]
+    assert stored[0].get("reasoning_content") == "step-one thinking"
+    assert stored[0]["tool_calls"][0]["function"]["arguments"] == \
+        s1[0]["tool_calls"][0]["function"]["arguments"]
+    # The newest step stays verbatim.
+    tool_messages = [m for m in agent.messages if m["role"] == "tool"]
+    assert "b" * 200 in tool_messages[1]["content"]
+    assert result["completed"] is True
+
+
+def test_ladder_escalates_through_every_level_and_backstops_with_summarize(
+    tmp_path, templates
+):
+    """A target line the first three levels cannot reach: the ladder runs all
+    four in order, every lifted-out text round-trips from the session log
+    directory, pairing survives, and only `arguments` changes on tool_calls."""
+    long_command = "echo " + "y" * 1000
+    reasoning_text = "step-one reasoning " * 5
+    s1 = assistant(tool_calls=[tool_call(1, command=long_command)],
+                   reasoning_content=reasoning_text)
+    s2 = assistant(tool_calls=[tool_call(2, command="true")])
+    summary_text = "1. Progress: the long command ran. 5. Remaining: finish."
+    s_summary = assistant(summary_text)
+    s_done = final_answer("wrapped up")
+    events = []
+    agent = _agent(tmp_path, templates,
+                   (s1, 100), (s2, 6000), (s_summary, 100), (s_done, 100),
+                   emit=events.append, compact=_compact(target_fraction=0.05))
+
+    result = agent.run("escalate through the whole ladder")
+
+    compact_events = [e for e in events if e["type"] == "compact"]
+    assert len(compact_events) == 1
+    event = compact_events[0]
+    assert event["layers"] == ["mask", "reasoning", "command", "summarize"]
+    assert event["layer"] == "summarize"
+    assert event["trigger"] == "threshold"
+    assert event["invalidated_from_index"] == 2
+    assert [tools is None for tools in agent.model.seen_tools] == [
+        False, False, True, False,
+    ]
+    assert result["completed"] is True
+
+    # The summarize prompt saw the ladder-rewritten history.
+    summary_prompt = agent.model.seen_prompts[2]
+    rewritten = [m for m in summary_prompt if m.get("tool_calls")][0]
+    original_call = s1[0]["tool_calls"][0]
+    rewritten_call = rewritten["tool_calls"][0]
+    # Every tool_calls field except `arguments` is byte-identical: Gemini's
+    # thought signature rides on those fields and a request missing it is
+    # rejected.
+    assert rewritten_call["id"] == original_call["id"]
+    assert rewritten_call["type"] == original_call["type"]
+    assert rewritten_call["index"] == original_call["index"]
+    assert rewritten_call["function"]["name"] == original_call["function"]["name"]
+    payload = json.loads(rewritten_call["function"]["arguments"])
+    assert payload["command"].startswith("echo ")
+    assert COMMAND_ELISION_MARKER in payload["command"]
+    # The elided command body round-trips from the file the note names.
+    command_note_path = re.search(
+        r"full text: (\S+) \.\.\.\]", payload["command"]
+    ).group(1)
+    assert Path(command_note_path).read_text(encoding="utf-8") == long_command
+    # The dropped reasoning round-trips from the session log directory too.
+    assert (Path(agent.environment.log_dir) / "s-1.reasoning.txt").read_text(
+        encoding="utf-8"
+    ) == reasoning_text
+    # The masked observation round-trips: the file at the placeholder's path
+    # holds the command's full output, and the observation that was replaced is
+    # exactly the observation template wrapped around it.
+    masked_tool = [m for m in summary_prompt if m["role"] == "tool"
+                   and m["tool_call_id"] == "call-1"][0]
+    assert masked_tool["content"].startswith(MASK_SENTINEL)
+    log_path = re.search(r"Full text: (\S+)\]", masked_tool["content"]).group(1)
+    log_text = Path(log_path).read_text(encoding="utf-8")
+    replaced = f"Exit code: 0\nOutput:\n{log_text}\n"
+    stated = int(re.search(r"original was (\d+) chars",
+                           masked_tool["content"]).group(1))
+    assert stated == len(replaced)
+
+    # The rebuilt history is [system, task, summary, verbatim tail]; the two
+    # rewritten steps are now small enough that both fit the tail budget, and
+    # pairing holds end to end.
+    assert [m["role"] for m in agent.messages] == [
+        "system", "user", "user", "assistant", "tool", "assistant", "tool",
+        "assistant",
+    ]
+    assert [m["tool_call_id"] for m in agent.messages if m["role"] == "tool"] == [
+        c["id"] for s in (s1, s2) for c in s[0]["tool_calls"]
+    ]
+    assert event["post_tokens_est"] == est_messages_tokens(agent.model.seen_prompts[3])
+
+
+def test_ladder_levels_are_idempotent():
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}]
+    for index in range(3):
+        messages.append({"role": "assistant", "content": "",
+                         "tool_calls": [tool_call(index + 1,
+                                                  command="echo " + "y" * 1000)],
+                         "reasoning_content": f"thinking {index} " * 10})
+        messages.append({"role": "tool", "tool_call_id": f"call-{index + 1}",
+                         "content": f"Exit code: 0\nOutput:\n{'x' * 2000}"})
+    tail_start, _ = verbatim_tail_span(messages, tail_budget_tokens=100)
+    log_paths = {f"call-{index + 1}": f"/logs/s-{index + 1}-1.log"
+                 for index in range(3)}
+    reasoning_writes = []
+    command_writes = []
+
+    def save_reasoning(text, ordinal):
+        path = f"/logs/s-{ordinal}.reasoning.txt"
+        reasoning_writes.append((path, text))
+        return path
+
+    def save_command(text, ordinal, call_index):
+        path = f"/logs/s-{ordinal}-{call_index}.command.txt"
+        command_writes.append((path, text))
+        return path
+
+    assert mask_old_observations(messages, tail_start, log_paths) > 0
+    assert drop_old_reasoning(messages, tail_start, save=save_reasoning) > 0
+    assert elide_old_commands(messages, tail_start, 200, save=save_command) > 0
+    assert len(reasoning_writes) == 2
+    assert len(command_writes) == 2
+    snapshot = json.dumps(messages, sort_keys=True)
+
+    # A second pass over the rewritten history frees nothing and writes nothing.
+    assert mask_old_observations(messages, tail_start, log_paths) == 0
+    assert drop_old_reasoning(messages, tail_start, save=save_reasoning) == 0
+    assert elide_old_commands(messages, tail_start, 200, save=save_command) == 0
+    assert len(reasoning_writes) == 2
+    assert len(command_writes) == 2
+    assert json.dumps(messages, sort_keys=True) == snapshot
+
+
+def test_command_level_skips_unparseable_arguments_and_preserves_other_fields():
+    def call_with(arguments):
+        return {"id": "call-1", "type": "function", "index": 0,
+                "extra_content": {"google": {"thoughtSignature": "sig"}},
+                "function": {"name": "bash", "arguments": arguments}}
+
+    long_command = "echo " + "y" * 1000
+    messages = [{"role": "assistant", "content": "", "tool_calls": [
+        call_with("{not json"),
+        call_with(json.dumps({"command": long_command})),
+        call_with(json.dumps({"command": "short"})),
+        call_with(json.dumps({"cwd": "/tmp", "command": long_command})),
+    ]}]
+    saved = []
+
+    def save(text, ordinal, call_index):
+        path = f"/logs/s-{ordinal}-{call_index}.command.txt"
+        saved.append((path, text))
+        return path
+
+    freed = elide_old_commands(messages, tail_start=1, head_chars=200, save=save)
+
+    calls = messages[0]["tool_calls"]
+    # A payload that does not parse is skipped, not rewritten.
+    assert calls[0]["function"]["arguments"] == "{not json"
+    # A command at or under the head length is untouched, not by a character.
+    assert calls[2]["function"]["arguments"] == json.dumps({"command": "short"})
+    # The long ones are elided; every field outside `arguments` is byte-identical.
+    payload = json.loads(calls[1]["function"]["arguments"])
+    assert payload["command"].startswith("echo ")
+    assert COMMAND_ELISION_MARKER in payload["command"]
+    assert calls[1]["id"] == "call-1"
+    assert calls[1]["type"] == "function"
+    assert calls[1]["index"] == 0
+    assert calls[1]["extra_content"] == {"google": {"thoughtSignature": "sig"}}
+    assert calls[1]["function"]["name"] == "bash"
+    # Extra payload keys ride along.
+    payload4 = json.loads(calls[3]["function"]["arguments"])
+    assert payload4["cwd"] == "/tmp"
+    assert COMMAND_ELISION_MARKER in payload4["command"]
+    assert saved == [(f"/logs/s-1-{call_index}.command.txt", long_command)
+                     for call_index in (2, 4)]
+    assert freed > 0
+
+    # A second pass is a no-op: the elision marker makes it idempotent.
+    saved.clear()
+    assert elide_old_commands(messages, tail_start=1, head_chars=200, save=save) == 0
+    assert saved == []
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 2: when the first three levels are not enough the history is
+# exactly [system, task, summary, tail] with the tail in whole steps.
 # ---------------------------------------------------------------------------
 
 def test_summarize_rebuilds_history_when_masking_is_not_enough(tmp_path, templates):
@@ -302,7 +546,7 @@ def test_summarize_rebuilds_history_when_masking_is_not_enough(tmp_path, templat
     s3 = final_answer("wrapping up")
     events = []
     agent = _agent(tmp_path, templates,
-                   (s1, 100), (s2, 4900), (s_summary, 100), (s3, 100),
+                   (s1, 100), (s2, 6000), (s_summary, 100), (s3, 100),
                    emit=events.append)
 
     result = agent.run("two big steps then done")
@@ -331,7 +575,8 @@ def test_summarize_rebuilds_history_when_masking_is_not_enough(tmp_path, templat
     # The tail budget (1200 chars) fits neither the masked middle nor more than
     # the last step; the last step is kept anyway (always at least one).
     assert [m["role"] for m in tail] == ["assistant", "tool"]
-    # The summary call used the masked history plus the compact_prompt, no tools.
+    # The summary call used the ladder-rewritten history plus the compact
+    # prompt, no tools.
     assert agent.model.seen_tools[2] is None
     summary_prompt = agent.model.seen_prompts[2]
     assert summary_prompt[-1] == {"role": "user",
@@ -345,6 +590,8 @@ def test_summarize_rebuilds_history_when_masking_is_not_enough(tmp_path, templat
     compact_events = [e for e in events if e["type"] == "compact"]
     assert len(compact_events) == 1
     assert compact_events[0]["layer"] == "summarize"
+    assert compact_events[0]["layers"] == ["mask", "reasoning", "command",
+                                           "summarize"]
     assert compact_events[0]["trigger"] == "threshold"
 
 
@@ -368,9 +615,17 @@ def test_overflow_compacts_and_retries_once_then_completes(tmp_path, templates):
     assert len(agent.model.seen_prompts) == 3  # failed call, summary, retry
     compact_events = [e for e in events if e["type"] == "compact"]
     assert len(compact_events) == 1
-    assert set(compact_events[0]) == {"type", "step", "layer", "trigger",
-                                      "pre_tokens", "post_tokens_est"}
+    assert set(compact_events[0]) == {"type", "step", "layers", "layer",
+                                      "trigger", "pre_tokens",
+                                      "post_tokens_est", "target_tokens",
+                                      "floor_tokens",
+                                      "steps_since_last_compact",
+                                      "invalidated_from_index"}
     assert compact_events[0]["trigger"] == "overflow"
+    # Overflow goes straight to the summarize level: the endpoint refused the
+    # call, so there is no trustworthy measured anchor for the ladder's
+    # anchored arithmetic at that moment.
+    assert compact_events[0]["layers"] == ["summarize"]
     assert compact_events[0]["layer"] == "summarize"
     assert compact_events[0]["pre_tokens"] == est_messages_tokens(agent.model.seen_prompts[0])
     assert compact_events[0]["post_tokens_est"] == est_messages_tokens(agent.model.seen_prompts[2])
@@ -447,6 +702,48 @@ def test_unrelated_400_propagates_unchanged(tmp_path, templates):
 
 
 # ---------------------------------------------------------------------------
+# The floor: startup preflight, and no per-step compaction when the floor is
+# already high.
+# ---------------------------------------------------------------------------
+
+def test_floor_above_the_threshold_never_compacts_per_step(tmp_path, templates, capsys):
+    """A session whose floor is already high must not pay a full re-prefill on
+    every step: the min-gain condition holds the ladder off, the history keeps
+    growing, and the over-window path handles the real ceiling."""
+    events = []
+    agent = _agent(tmp_path, templates,
+                   (assistant(tool_calls=[tool_call(1, command="true")]), 6000),
+                   (assistant(tool_calls=[tool_call(2, command="true")]), 7000),
+                   (final_answer("done"), 100),
+                   compact=_compact(keep_tail_tokens=6000, min_gain_tokens=16384),
+                   emit=events.append)
+
+    result = agent.run("grow the history past the threshold")
+
+    assert result["completed"] is True
+    assert not any(e["type"] == "compact" for e in events)
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert "floor" in err
+
+
+def test_floor_at_or_above_the_window_fails_at_startup_naming_the_parts(
+    tmp_path, templates
+):
+    agent = _agent(tmp_path, templates, (final_answer("done"), 100),
+                   compact=_compact(keep_tail_tokens=12000))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        agent.run("an impossible floor")
+
+    message = str(excinfo.value)
+    assert "reaches the context window" in message
+    assert "system=" in message
+    assert "task=" in message
+    assert "tail=12000" in message
+
+
+# ---------------------------------------------------------------------------
 # Acceptance 4: state file is readable right after compaction and --resume works.
 # ---------------------------------------------------------------------------
 
@@ -457,7 +754,7 @@ def test_state_file_readable_after_compaction_and_agent_resume(tmp_path, templat
     s_done = final_answer("turn one done")
     state_file = tmp_path / "session.json"
     agent = _agent(tmp_path, templates,
-                   (s1, 100), (s2, 4900), (s_summary, 100), (s_done, 100),
+                   (s1, 100), (s2, 6000), (s_summary, 100), (s_done, 100),
                    state_file=str(state_file))
 
     agent.run("turn one")
@@ -503,7 +800,7 @@ def test_cli_resume_works_on_a_compacted_session(tmp_path, monkeypatch, task_fil
         final_answer("turn one done"),
         final_answer("turn two done"),
     ])
-    tokens = iter([100, 4900, 100, 100, 100])
+    tokens = iter([100, 6000, 100, 100, 100])
     captured = []
 
     def query(self, messages, tools=None):
@@ -655,6 +952,10 @@ def test_single_oversized_observation_is_truncated_head_note_tail(tmp_path, temp
     assert observation.endswith("a" * 100 + "\n")
     assert (f"observation truncated by the per-step budget: original was "
             f"{expected_original} chars") in observation
+    # The note names the log file holding the full text, and that file exists.
+    log_path = re.search(r"Full text: (\S+) \.\.\.\]", observation).group(1)
+    assert log_path == str(Path(agent.environment.log_dir) / "s-1-1.log")
+    assert len(Path(log_path).read_text()) == 30000
     # The session went on: the model saw the bounded observation and finished.
     assert result["steps"][0]["observation"] == observation
 
@@ -675,20 +976,23 @@ def test_multi_call_step_over_budget_gets_note_replacements(tmp_path, templates)
     assert len(contents) == 4
     # Call 1 fits whole (822 chars); call 2 exceeds the remaining 178 and is
     # truncated to exactly the remaining budget; calls 3-4 run normally but
-    # enter history as one-line notes stating the original length.
+    # enter history as one-line notes stating the original length and the log
+    # file holding the full text.
     assert len(contents[0]) == 822
     assert contents[0].startswith("Exit code: 0\nOutput:\na")
-    assert len(contents[1]) == 178
-    assert "observation truncated by the per-step budget: original was 822" \
-           in contents[1]
-    for note in contents[2:]:
+    # Call 2 exceeds the remaining 178, but the elision note now carries the
+    # log path and no longer fits that remainder, so it is replaced too.
+    for index, note in enumerate(contents[1:], start=2):
         assert note.startswith("[observation not recorded: the per-step "
                                "budget was exhausted; original was 822 chars.")
-        assert "Re-run the command with filters" in note
-    # The step's observation payload entering history stays within the budget
-    # (the one-line replacement notes are the sanctioned bounded overrun).
-    payload = sum(len(c) for c in contents[:2])
-    assert payload == 1000
+        assert note.count("\n") == 0  # one line
+        assert "Full text:" in note
+        log_path = re.search(r"Full text: (\S+)\.\]", note).group(1)
+        assert Path(log_path).read_text() == chr(ord("a") + index - 1) * 800
+    # The step's charged payload stays within the budget: call 1 fit whole
+    # (822 of the 1000 charged); from call 2 on the elision note no longer
+    # fits the remainder, so each observation becomes a one-line replacement
+    # note charging 0 (the sanctioned bounded overrun).
     assert [step["command"] for step in result["steps"]] == [
         json.loads(c["function"]["arguments"])["command"] for c in calls
     ]
@@ -711,24 +1015,95 @@ def test_marker_gate_runs_on_complete_output_before_any_budget(tmp_path, templat
 
 
 # ---------------------------------------------------------------------------
+# The floor's estimator: image-bearing task messages.
+# ---------------------------------------------------------------------------
+
+def test_est_message_chars_sums_parts_lists_per_part():
+    message = {"role": "user", "content": [
+        {"type": "text", "text": "hello"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]}
+    assert est_message_chars(message, image_tokens=1600) == len("hello") + 1600 * 4
+    # A parts list estimated without the configured constant contributes only
+    # its text, so a caller estimating a history that can hold the task message
+    # must pass it.
+    assert est_message_chars(message) == len("hello")
+
+
+def test_image_task_message_is_estimated_from_the_configured_constant(
+    tmp_path, templates
+):
+    png = tmp_path / "tiny.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+    agent = _agent(tmp_path, templates, (final_answer("done"), 100), images=[png])
+
+    task_message = agent._task_message("look at this")
+    assert task_message["content"][1]["type"] == "image_url"
+    # Four-chars-per-token on the base64 body would estimate this image at a
+    # handful of tokens (the old len()-of-the-list bug estimated it as 1); the
+    # configured constant says 1600.
+    assert est_message_chars(task_message, image_tokens=1600) >= 1600 * 4
+    agent.messages = [{"role": "system", "content": "s"}, task_message]
+    assert agent._floor_tokens() >= 1600 + 300
+
+
+# ---------------------------------------------------------------------------
+# The masked observation reads back from the placeholder's path.
+# ---------------------------------------------------------------------------
+
+def test_masked_observation_round_trips_through_the_placeholder_path(
+    tmp_path, templates
+):
+    s1 = assistant(tool_calls=[tool_call(1, command=_big_output(20000, "a"))])
+    s2 = assistant(tool_calls=[tool_call(2, command="true")])
+    agent = _agent(tmp_path, templates, (s1, 100), (s2, 8500),
+                   (final_answer("done"), 100),
+                   compact=_compact(min_gain_tokens=3000))
+
+    result = agent.run("mask the big observation")
+
+    assert result["completed"] is True
+    tool_messages = [m for m in agent.messages if m["role"] == "tool"]
+    placeholder = tool_messages[0]["content"]
+    assert placeholder.startswith(MASK_SENTINEL)
+    log_path = re.search(r"Full text: (\S+)\]", placeholder).group(1)
+    # The file at the placeholder's path holds the command's full output, and
+    # the observation that was replaced is byte-for-byte the observation
+    # template wrapped around it.
+    log_text = Path(log_path).read_text(encoding="utf-8")
+    replaced = f"Exit code: 0\nOutput:\n{log_text}\n"
+    stated = int(re.search(r"original was (\d+) chars", placeholder).group(1))
+    assert stated == len(replaced)
+    assert replaced == "Exit code: 0\nOutput:\n" + "a" * 20000 + "\n"
+    # The placeholder is shorter than what it replaced.
+    assert len(placeholder) < len(replaced)
+
+
+# ---------------------------------------------------------------------------
 # Helper-level invariants.
 # ---------------------------------------------------------------------------
 
 def test_bound_observation_variants():
-    whole, charged = bound_observation("x" * 100, remaining=500)
+    whole, charged = bound_observation("x" * 100, remaining=500,
+                                       log_path="/logs/s-1-1.log")
     assert (whole, charged) == ("x" * 100, 100)
 
-    truncated, charged = bound_observation("y" * 1000, remaining=200)
+    truncated, charged = bound_observation("y" * 1000, remaining=200,
+                                           log_path="/logs/s-1-1.log")
     assert charged == len(truncated) == 200
-    assert truncated.startswith("y" * 40)
-    assert truncated.endswith("y" * 40)
+    note = ELISION_NOTE.format(original=1000, path="/logs/s-1-1.log")
+    body = 200 - len(note)
+    assert truncated.startswith("y" * (body // 2))
+    assert truncated.endswith("y" * (body - body // 2))
     assert "original was 1000 chars" in truncated
+    assert "/logs/s-1-1.log" in truncated
 
-    note, charged = bound_observation("z" * 1000, remaining=0)
+    note, charged = bound_observation("z" * 1000, remaining=0,
+                                      log_path="/logs/s-1-1.log")
     assert charged == 0
     assert note.count("\n") == 0  # one line
     assert "original was 1000 chars" in note
-    assert "Re-run the command with filters" in note
+    assert "/logs/s-1-1.log" in note
 
 
 def test_verbatim_tail_keeps_whole_steps_and_at_least_the_last():

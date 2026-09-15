@@ -4,6 +4,7 @@ All agent logic lives in src/ (agent.py, model.py, environment.py).
 """
 
 import contextlib
+import datetime
 import json
 import os
 import sys
@@ -223,6 +224,14 @@ def run(
     os.makedirs(resolved_session_dir, exist_ok=True)
     session_id = resume or str(uuid.uuid4())
     state_file = os.path.join(resolved_session_dir, f"{session_id}.json")
+    # Run-scoped session log directory: command logs and every text compaction
+    # lifts out of history live here, keyed by run start so a resumed run never
+    # overwrites an earlier run's files. Nothing is deleted at exit.
+    run_started_at = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    log_dir = os.path.join(resolved_session_dir, f"{session_id}.d", run_started_at)
+    os.makedirs(log_dir, exist_ok=True)
     step_limit = steps if steps is not None else config["agent"]["step_limit"]
 
     agent = Agent(
@@ -233,7 +242,11 @@ def run(
             timeout_seconds=timeout_seconds,
             stream=stream,
         ),
-        environment=Environment(cwd=working_dir, timeout=config["environment"]["timeout"]),
+        environment=Environment(
+            cwd=working_dir,
+            timeout=config["environment"]["timeout"],
+            log_dir=log_dir,
+        ),
         templates=config["templates"],
         step_limit=step_limit,
         skills_catalog=load_skill_catalog(skill_roots),
@@ -262,7 +275,6 @@ def run(
             _print_log_retention(agent.environment)
             raise typer.Exit(1) from None
 
-        agent.environment.cleanup_log_dir()
         _emit({
             "type": "result",
             "completed": result["completed"],
@@ -283,7 +295,6 @@ def run(
         _print_log_retention(agent.environment)
         raise typer.Exit(1) from None
 
-    agent.environment.cleanup_log_dir()
     _print_trajectory(result)
 
 

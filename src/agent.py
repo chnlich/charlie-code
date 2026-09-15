@@ -7,12 +7,16 @@ the reply's last line is the completion sentinel and an answer stands above it.
 Shape alone never proves completion, because a truncated reply looks exactly like
 a finished one; a sentinel cannot be truncated into existence.
 
-To keep long sessions alive near the context window, the loop compacts history in
-layers (see compact.py): a per-step entry budget bounds every step's observations
-before they enter history; at a step boundary whose measured-plus-estimated size
-reaches the threshold, old observations are masked (lossless: re-run to re-read),
-and when that is not enough a structured summary plus a verbatim tail replaces the
-history. An over-window error from the endpoint runs the same compaction and
+To keep long sessions alive near the context window, the loop compacts history
+with a ladder (see compact.py): a per-step entry budget bounds every step's
+observations before they enter history; at a step boundary whose
+measured-plus-estimated size reaches the threshold line and buys at least
+min_gain_tokens above the target line, the ladder runs mask old observations,
+drop old reasoning, elide old command bodies, and summarize in order, stopping
+once the estimate is at or below the target line. Every rewritten text is saved
+under the run's session log directory and its placeholder names that file, so
+nothing is lost and no placeholder asks the model to re-run a command. An
+over-window error from the endpoint goes straight to the summarize level and
 retries the call once instead of killing the session.
 
 Every message enters history through `Agent._append_message`, which rewrites the
@@ -33,7 +37,9 @@ from litellm.exceptions import ContextWindowExceededError
 
 from compact import (
     bound_observation,
+    drop_old_reasoning,
     drop_oldest_middle_half,
+    elide_old_commands,
     est_messages_tokens,
     mask_old_observations,
     verbatim_tail_span,
@@ -87,6 +93,30 @@ CONTROL_MARKERS = (
 
 def load_config(path=DEFAULT_CONFIG_PATH):
     return yaml.safe_load(Path(path).read_text())
+
+
+def _rewrite_fingerprints(messages):
+    """References to the values a ladder level can rewrite, one entry per
+    message: (content, reasoning_content, [tool_calls arguments]).
+
+    The levels mutate messages in place, so comparing message dicts against a
+    snapshot would compare a dict with itself. Comparing these value
+    references instead: an untouched message holds the same objects, a
+    rewritten one holds new strings or has lost the reasoning field. Holding
+    the pre-pass references keeps them alive, so identity is decisive.
+    """
+    return [
+        (
+            message.get("content"),
+            message.get("reasoning_content"),
+            [
+                call["function"].get("arguments")
+                if isinstance(call.get("function"), dict) else None
+                for call in (message.get("tool_calls") or [])
+            ],
+        )
+        for message in messages
+    ]
 
 
 def render(template, **values):
@@ -275,6 +305,12 @@ class Agent:
         # are what the last measured prompt_tokens does not yet account for. None
         # right after a compaction, until the next query re-anchors the estimate.
         self._last_query_index = None
+        # tool_call_id -> log file holding the command's full output, for the
+        # observations this run appended. Masking points placeholders at these
+        # files; observations inherited from an earlier run have no entry here.
+        self._observation_logs = {}
+        # Step number of the last compaction, for steps_since_last_compact.
+        self._last_compact_step = 0
 
     def _initial_messages(self):
         """History before this turn's task message.
@@ -347,7 +383,13 @@ class Agent:
             step_thought = thought if index == 1 else ""
             command, error = tool_call_command(tool_call)
             if error is not None:
-                bounded, charged = bound_observation(error, remaining)
+                # An invalid call never ran, so it has no command log; when its
+                # text will not fit the budget whole, save it as the full text
+                # the budget note names.
+                log_path = None
+                if len(error) > remaining:
+                    log_path = self._save_full_text(f"s-{step_idx}-{index}.log", error)
+                bounded, charged = bound_observation(error, remaining, log_path)
                 remaining -= charged
                 self._append_message({"role": "tool",
                                       "tool_call_id": tool_call.get("id"),
@@ -361,7 +403,8 @@ class Agent:
                 self.emit({"type": "command", "step": step_idx,
                            "id": event_id, "command": command})
 
-            result = self.environment.execute(command)
+            result = self.environment.execute(command, step_idx, index)
+            log_path = result["log_path"]
             output, note = gate_output(result["output"])
             if self.emit:
                 self.emit({"type": "observation", "step": step_idx,
@@ -375,8 +418,10 @@ class Agent:
             )
             if note:
                 observation = f"[{note}]\n{observation}"
-            bounded, charged = bound_observation(observation, remaining)
+            bounded, charged = bound_observation(observation, remaining, log_path)
             remaining -= charged
+            if tool_call.get("id") is not None:
+                self._observation_logs[tool_call["id"]] = log_path
             self._append_message({"role": "tool",
                                   "tool_call_id": tool_call.get("id"),
                                   "content": bounded})
@@ -385,8 +430,84 @@ class Agent:
                             "returncode": result["returncode"], "note": note})
         return records
 
+    def _save_full_text(self, filename, text):
+        """Write one text into the run's session log directory; return its path.
+
+        This is how the texts the compaction ladder lifts out of history - a
+        dropped reasoning block, an elided command body, an observation the
+        entry budget could not record - stay readable at the path a placeholder
+        names. Nothing is ever deleted.
+        """
+        path = Path(self.environment.log_dir) / filename
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def _save_reasoning(self, text, span_ordinal):
+        return self._save_full_text(f"s-{span_ordinal}.reasoning.txt", text)
+
+    def _save_command(self, text, span_ordinal, call_index):
+        return self._save_full_text(
+            f"s-{span_ordinal}-{call_index}.command.txt", text
+        )
+
     def _threshold_tokens(self):
         return int(self.compact["threshold_fraction"] * self.compact["context_window"])
+
+    def _floor_parts(self):
+        """(system, task, tail) token estimates, the floor's three parts.
+
+        The floor is the incompressible part of the history: the system prompt
+        and task the summarize level preserves, plus the verbatim tail the
+        ladder's first three levels keep. Compaction can never push the
+        estimate below it.
+        """
+        image_tokens = self.compact["image_tokens"]
+        return (
+            est_messages_tokens(self.messages[:1], image_tokens),
+            est_messages_tokens(self.messages[1:2], image_tokens),
+            self.compact["keep_tail_tokens"],
+        )
+
+    def _floor_tokens(self):
+        return sum(self._floor_parts())
+
+    def _target_tokens(self):
+        """The line compaction stops on: the configured fraction of the window,
+        but never below the floor - the floor cannot be compacted away, so a
+        target under it would only make the ladder run to its end in vain."""
+        return max(
+            int(self.compact["target_fraction"] * self.compact["context_window"]),
+            self._floor_tokens(),
+        )
+
+    def _preflight_floor(self):
+        """Startup check on the floor, run once the initial history exists.
+
+        A floor at or above the window kills the run at startup, naming each
+        part's token count, because no compaction can ever reach the target
+        line. A floor between the threshold line and the window gets one
+        warning: compaction cannot free enough space to matter, so the session
+        will run on the over-window path instead.
+        """
+        system_tokens, task_tokens, tail_tokens = self._floor_parts()
+        floor = system_tokens + task_tokens + tail_tokens
+        window = self.compact["context_window"]
+        if floor >= window:
+            raise RuntimeError(
+                f"session floor of {floor} tokens reaches the context window of "
+                f"{window} tokens: system={system_tokens}, task={task_tokens}, "
+                f"tail={tail_tokens}; compaction can never get under the target "
+                f"line, so the session cannot run."
+            )
+        if floor >= self._threshold_tokens():
+            print(
+                f"warning: session floor of {floor} tokens is above the "
+                f"compaction threshold of {self._threshold_tokens()} tokens "
+                f"(system={system_tokens}, task={task_tokens}, "
+                f"tail={tail_tokens}); compaction cannot buy enough space, so "
+                f"the history will grow until the endpoint reports over-window.",
+                file=sys.stderr,
+            )
 
     def _anchored_estimate(self):
         """prompt_tokens measured by the last call plus chars/4 of what was
@@ -395,7 +516,9 @@ class Agent:
         measured = self.model.last_prompt_tokens
         if measured is None or self._last_query_index is None:
             return None
-        return measured + est_messages_tokens(self.messages[self._last_query_index:])
+        return measured + est_messages_tokens(
+            self.messages[self._last_query_index:], self.compact["image_tokens"]
+        )
 
     def _query_step(self, step_idx):
         """One model call with the over-window fallback.
@@ -418,53 +541,119 @@ class Agent:
             ) from exc
 
     def _maybe_compact(self, step_idx):
-        """Threshold trigger, checked at step boundaries."""
+        """Threshold trigger, checked at step boundaries.
+
+        Two conditions must hold: the anchored estimate reaches the threshold
+        line, and it exceeds the target line by at least min_gain_tokens. The
+        second condition keeps a session whose floor is already high from
+        paying a full re-prefill every step: compaction would buy less than the
+        rewrite costs, so the history keeps growing and the over-window path
+        handles the real ceiling.
+        """
         estimate = self._anchored_estimate()
         if estimate is None or estimate < self._threshold_tokens():
+            return
+        if estimate < self._target_tokens() + self.compact["min_gain_tokens"]:
             return
         self._compact(step_idx, trigger="threshold", pre_tokens=estimate)
 
     def _compact(self, step_idx, trigger, pre_tokens=None):
-        """One compaction pass: mask layer, summarize layer when masking is not
-        enough (or the endpoint already reported overflow), then persist and
-        emit. Compaction rewrites self.messages in place; the state protocol is
-        untouched."""
-        before_mask_est = est_messages_tokens(self.messages)
+        """One compaction pass over the configured ladder, then persist and emit.
+
+        The first three levels (mask, reasoning, command) rewrite history in
+        place outside the one verbatim tail all four levels share; the
+        summarize level rebuilds the history as [system, task, summary, tail].
+        The ladder stops as soon as the estimate is at or below the target
+        line. An over-window endpoint error goes straight to the summarize
+        level: the endpoint refused the call, so there is no trustworthy
+        measured anchor for the first three levels' arithmetic at that moment.
+
+        After each of the first three levels the estimate is anchored on the
+        last measured prompt_tokens minus only the characters the pass freed
+        (chars/4); a fresh whole-history estimate could hide an overfull
+        prompt. After the summarize level the rebuilt history is estimated
+        directly. Compaction rewrites self.messages in place; the state
+        protocol is untouched.
+        """
+        image_tokens = self.compact["image_tokens"]
+        ladder = list(self.compact["ladder"])
+        target_tokens = self._target_tokens()
+        floor_tokens = self._floor_tokens()
         if pre_tokens is None:
             estimate = self._anchored_estimate()
             pre_tokens = (estimate if estimate is not None
-                          else before_mask_est)
-
-        mask_old_observations(self.messages, self.compact["mask_keep_steps"])
-        # Keep measured token calibration: chars/4 estimates only the masking
-        # delta, since a fresh whole-history estimate can hide an overfull prompt.
-        post_tokens_est = max(
-            0, pre_tokens + est_messages_tokens(self.messages) - before_mask_est
+                          else est_messages_tokens(self.messages, image_tokens))
+        anchor = self.model.last_prompt_tokens
+        if trigger == "overflow" and "summarize" in ladder:
+            ladder = ladder[ladder.index("summarize"):]
+        tail_start, _ = verbatim_tail_span(
+            self.messages, self.compact["keep_tail_tokens"]
         )
-        layer = "mask"
-        if (trigger == "overflow"
-                or post_tokens_est >= self._threshold_tokens()):
-            self._summarize_layer(step_idx)
-            layer = "summarize"
-            post_tokens_est = est_messages_tokens(self.messages)
+        fingerprints = _rewrite_fingerprints(self.messages)
+
+        freed_chars = 0
+        layers_run = []
+        for level in ladder:
+            if level == "summarize":
+                self._summarize_layer(step_idx)
+                layers_run.append(level)
+                post_tokens_est = est_messages_tokens(self.messages, image_tokens)
+                break
+            if level == "mask":
+                freed = mask_old_observations(
+                    self.messages, tail_start, self._observation_logs
+                )
+            elif level == "reasoning":
+                freed = drop_old_reasoning(
+                    self.messages, tail_start, save=self._save_reasoning
+                )
+            elif level == "command":
+                freed = elide_old_commands(
+                    self.messages, tail_start,
+                    self.compact["command_head_chars"], save=self._save_command,
+                )
+            else:
+                raise RuntimeError(f"unknown compaction ladder level {level!r}")
+            layers_run.append(level)
+            freed_chars += freed
+            post_tokens_est = max(
+                0, int((anchor if anchor is not None else pre_tokens)
+                       - freed_chars // 4)
+            )
+            if post_tokens_est <= target_tokens:
+                break
+
+        invalidated_from_index = None
+        for index in range(min(len(fingerprints), len(self.messages))):
+            if _rewrite_fingerprints(self.messages[index:index + 1])[0] != fingerprints[index]:
+                invalidated_from_index = index
+                break
 
         self._persist_messages()
         self._last_query_index = None
+        steps_since_last_compact = step_idx - self._last_compact_step
+        self._last_compact_step = step_idx
         event = {
             "type": "compact",
             "step": step_idx,
-            "layer": layer,
+            "layers": layers_run,
+            "layer": layers_run[-1],
             "trigger": trigger,
             "pre_tokens": int(pre_tokens),
             "post_tokens_est": post_tokens_est,
+            "target_tokens": target_tokens,
+            "floor_tokens": floor_tokens,
+            "steps_since_last_compact": steps_since_last_compact,
+            "invalidated_from_index": invalidated_from_index,
         }
         if self.emit:
             self.emit(event)
         else:
             print(
-                f"[compact] step {step_idx} layer={layer} trigger={trigger} "
-                f"pre_tokens={event['pre_tokens']} "
-                f"post_tokens_est={event['post_tokens_est']}",
+                f"[compact] step {step_idx} layers={','.join(layers_run)} "
+                f"trigger={trigger} pre_tokens={event['pre_tokens']} "
+                f"post_tokens_est={event['post_tokens_est']} "
+                f"target_tokens={event['target_tokens']}",
                 file=sys.stderr,
             )
 
@@ -555,6 +744,7 @@ class Agent:
     def run(self, task):
         self.messages = self._initial_messages()
         self._append_message(self._task_message(task))
+        self._preflight_floor()
         steps = []
         try:
             for step_idx in range(1, self.step_limit + 1):
@@ -565,6 +755,7 @@ class Agent:
                         "type": "context",
                         "step": step_idx,
                         "prompt_tokens": self.model.last_prompt_tokens,
+                        "cached_tokens": self.model.last_cached_tokens,
                         "context_window": self.compact["context_window"],
                         "compact_threshold": self._threshold_tokens(),
                         "model": self.model.model_name,

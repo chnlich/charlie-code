@@ -35,9 +35,9 @@ def _log_path_from_output(output):
 
 
 def test_demoted_command_reports_pid_log_path_and_is_still_alive(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=1)
+    env = Environment(cwd=str(tmp_path), timeout=1, log_dir=str(tmp_path))
 
-    result = env.execute("sleep infinity")
+    result = env.execute("sleep infinity", 1, 1)
 
     assert result["returncode"] == -1
     assert "still running" in result["output"]
@@ -53,10 +53,10 @@ def test_demoted_command_reports_pid_log_path_and_is_still_alive(tmp_path):
 
 
 def test_demoted_command_is_not_killed_and_later_finishes_on_its_own(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=1)
+    env = Environment(cwd=str(tmp_path), timeout=1, log_dir=str(tmp_path))
     marker = tmp_path / "done"
 
-    result = env.execute(f"sleep 2 && touch {marker}")
+    result = env.execute(f"sleep 2 && touch {marker}", 1, 1)
 
     assert result["returncode"] == -1
     pid = _pid_from_output(result["output"])
@@ -72,8 +72,8 @@ def test_demoted_command_is_not_killed_and_later_finishes_on_its_own(tmp_path):
 
 
 def test_sweep_kills_every_registered_job_and_clears_the_roster(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=1)
-    result = env.execute("sleep infinity")
+    env = Environment(cwd=str(tmp_path), timeout=1, log_dir=str(tmp_path))
+    result = env.execute("sleep infinity", 1, 1)
     pid = _pid_from_output(result["output"])
     assert _alive(pid)
     assert len(env.roster) == 1
@@ -86,9 +86,9 @@ def test_sweep_kills_every_registered_job_and_clears_the_roster(tmp_path):
 
 
 def test_command_returning_in_budget_reaps_its_backgrounded_survivor(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=5)
+    env = Environment(cwd=str(tmp_path), timeout=5, log_dir=str(tmp_path))
 
-    result = env.execute("sleep 100 & echo $!")
+    result = env.execute("sleep 100 & echo $!", 1, 1)
 
     assert result["returncode"] == 0
     pid = int(result["output"].strip())
@@ -97,9 +97,9 @@ def test_command_returning_in_budget_reaps_its_backgrounded_survivor(tmp_path):
 
 
 def test_setsid_escape_hatch_survives_command_end(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=5)
+    env = Environment(cwd=str(tmp_path), timeout=5, log_dir=str(tmp_path))
 
-    result = env.execute("setsid nohup sleep 100 > /dev/null 2>&1 & echo $!")
+    result = env.execute("setsid nohup sleep 100 > /dev/null 2>&1 & echo $!", 1, 1)
 
     assert result["returncode"] == 0
     pid = int(result["output"].strip())
@@ -111,10 +111,10 @@ def test_setsid_escape_hatch_survives_command_end(tmp_path):
 
 
 def test_bare_cat_fails_fast_on_stdin_eof(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=60)
+    env = Environment(cwd=str(tmp_path), timeout=60, log_dir=str(tmp_path))
 
     start = time.monotonic()
-    result = env.execute("cat")
+    result = env.execute("cat", 1, 1)
     elapsed = time.monotonic() - start
 
     assert result["returncode"] == 0
@@ -122,18 +122,24 @@ def test_bare_cat_fails_fast_on_stdin_eof(tmp_path):
 
 
 def test_normal_completion_returns_dict_shape_and_log_content(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=10)
+    env = Environment(cwd=str(tmp_path), timeout=10, log_dir=str(tmp_path))
 
-    result = env.execute("echo hello")
+    result = env.execute("echo hello", 1, 1)
 
-    assert result == {"output": "hello\n", "returncode": 0}
+    assert result == {"output": "hello\n", "returncode": 0,
+                      "log_path": str(tmp_path / "s-1-1.log")}
 
 
-def test_cleanup_log_dir_removes_the_run_directory(tmp_path):
-    env = Environment(cwd=str(tmp_path), timeout=10)
-    env.execute("echo hi")
-    assert os.path.isdir(env.log_dir)
+def test_command_log_is_written_to_the_given_dir_and_never_deleted(tmp_path):
+    log_dir = tmp_path / "run-logs"
+    log_dir.mkdir()
+    env = Environment(cwd=str(tmp_path), timeout=10, log_dir=str(log_dir))
 
-    env.cleanup_log_dir()
+    result = env.execute("echo hello", 3, 2)
 
-    assert not os.path.exists(env.log_dir)
+    assert result == {"output": "hello\n", "returncode": 0,
+                      "log_path": str(log_dir / "s-3-2.log")}
+    assert (log_dir / "s-3-2.log").read_text() == "hello\n"
+    # Session logs are never removed: compaction placeholders point at them.
+    env.sweep()
+    assert (log_dir / "s-3-2.log").exists()

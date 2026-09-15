@@ -52,6 +52,7 @@ class UsageModel:
         self.model_name = model_name
         self._steps = iter(steps)
         self.last_prompt_tokens = None
+        self.last_cached_tokens = 0
         self.seen_tools = []
 
     def query(self, messages, tools=None):
@@ -180,7 +181,8 @@ def test_agent_emit_collects_per_step_events(tmp_path):
                       tool_calls=[tool_call(1, command="printf hi > out.txt")]),
             final_answer("Wrote out.txt."),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=3,
         emit=events.append,
@@ -208,7 +210,8 @@ def test_agent_emit_collects_per_step_events(tmp_path):
 def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     success = Agent(
         model=ScriptedModel(final_answer("Nothing to do.")),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=1,
         emit=None,
@@ -223,7 +226,8 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
             assistant("No completion.",
                       tool_calls=[tool_call(1, command="echo not_done")]),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=1,
         emit=None,
@@ -238,7 +242,8 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
             (assistant("Working.", tool_calls=[tool_call(1, command="true")]), 4321),
             (final_answer("done"), 8765),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=3,
         emit=None,
@@ -258,7 +263,8 @@ def test_context_event_per_model_call_reports_that_calls_usage(tmp_path):
             (assistant("Second.", tool_calls=[tool_call(2, command="echo two")]), 222),
             (final_answer("all done"), 333),
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=5,
         emit=events.append,
@@ -278,8 +284,9 @@ def test_context_event_per_model_call_reports_that_calls_usage(tmp_path):
         (1, 111), (2, 222), (3, 333),
     ]
     for event in context_events:
-        assert set(event) == {"type", "step", "prompt_tokens", "context_window",
-                              "compact_threshold", "model"}
+        assert set(event) == {"type", "step", "prompt_tokens", "cached_tokens",
+                              "context_window", "compact_threshold", "model"}
+        assert event["cached_tokens"] == 0
         assert event["model"] == "openai/fake-model"
 
 
@@ -289,14 +296,20 @@ def test_context_event_threshold_is_fraction_times_window_for_the_config_in_use(
     compact = {
         "context_window": 10000,
         "threshold_fraction": 0.5,
-        "mask_keep_steps": 8,
+        "target_fraction": 0.3,
+        "min_gain_tokens": 16384,
+        "image_tokens": 1600,
+        "ladder": ["mask", "reasoning", "command", "summarize"],
+        "keep_tail_tokens": 300,
         "tail_budget_tokens": 24000,
+        "command_head_chars": 200,
         "step_observation_budget_chars": 40000,
     }
     events = []
     agent = Agent(
         model=UsageModel((final_answer("done"), 100)),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=2,
         emit=events.append,
@@ -346,6 +359,26 @@ def test_cli_context_window_flag_flows_into_the_context_event(
     assert event["model"] == load_config()["model"]["model_name"]
 
 
+def test_context_event_carries_the_cached_tokens_the_endpoint_reported(tmp_path):
+    events = []
+    model = UsageModel((final_answer("done"), 60012))
+    model.last_cached_tokens = 58880
+    agent = Agent(
+        model=model,
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                                log_dir=str(tmp_path)),
+        templates=load_config()["templates"],
+        step_limit=2,
+        emit=events.append,
+    )
+
+    agent.run("finish with a warm cache")
+
+    event = [event for event in events if event["type"] == "context"][0]
+    assert event["prompt_tokens"] == 60012
+    assert event["cached_tokens"] == 58880
+
+
 def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
     s_summary = assistant("1. Progress: nothing yet. 5. Remaining: everything.")
     s_done = final_answer("finished after retry")
@@ -356,7 +389,8 @@ def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
             (s_summary, 700),   # compaction summary call
             (s_done, 900),      # retried conversation call
         ),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=3,
         emit=events.append,
@@ -381,7 +415,8 @@ def test_context_event_without_usage_reports_null_prompt_tokens(tmp_path):
     compact = load_config()["compact"]
     agent = Agent(
         model=UsageModel((final_answer("done"), None)),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=load_config()["templates"],
         step_limit=2,
         emit=events.append,

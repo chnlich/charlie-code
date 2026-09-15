@@ -90,6 +90,23 @@ def _delta_tool_call_extras(chunks):
     return extras, index_by_id
 
 
+def prompt_cached_tokens(usage):
+    """cached_tokens from the endpoint's prompt_tokens_details, 0 when absent.
+
+    Endpoints disagree on the shape: some send the details object, some send
+    nothing at all. Absence is the normal case for a cold cache, not an error,
+    so it accounts as zero.
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    if isinstance(details, dict):
+        value = details.get("cached_tokens")
+    else:
+        value = getattr(details, "cached_tokens", None)
+    return value or 0
+
+
 def merge_stream_tool_call_fields(message, chunks):
     """Merge back onto each rebuilt tool call every field the raw deltas carried
     that the rebuild does not produce, aligned by fragment index.
@@ -117,8 +134,11 @@ class Model:
         self.n_calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cached_tokens = 0
         # prompt_tokens of the most recent call; the compaction trigger's anchor.
         self.last_prompt_tokens = None
+        # cached_tokens of the most recent call, for the per-step context event.
+        self.last_cached_tokens = 0
 
     def query(self, messages, tools=None):
         """Send the conversation and return (assistant message, finish_reason).
@@ -177,7 +197,9 @@ class Model:
         usage = response.usage
         self.input_tokens += usage.prompt_tokens
         self.output_tokens += usage.completion_tokens
+        self.cached_tokens += prompt_cached_tokens(usage)
         self.last_prompt_tokens = usage.prompt_tokens
+        self.last_cached_tokens = prompt_cached_tokens(usage)
         choice = response.choices[0]
         message = as_message_dict(choice.message)
         if self.stream:
@@ -189,4 +211,5 @@ class Model:
             "n_calls": self.n_calls,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
         }

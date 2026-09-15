@@ -24,23 +24,42 @@ agent:
   unfinished_reply_limit: 3
 
 # Layered context compaction. Every observation entering history is bounded by the
-# per-step entry budget; at a step boundary whose measured prompt tokens (plus a
+# per-step entry budget. At a step boundary whose measured prompt tokens (plus a
 # chars/4 estimate of what was appended since) reach threshold_fraction *
-# context_window, old tool observations are masked with re-readable placeholders,
-# and if that is still not enough the history is rebuilt as [system, task,
-# summary, verbatim tail]. An over-window error from the endpoint runs the same
-# compaction and retries the call once. context_window can be overridden per
-# invocation with --context-window.
+# context_window AND stand at least min_gain_tokens above the target line, the
+# ladder runs in order - mask old observations, drop old reasoning, elide old
+# command bodies, rebuild from a summary - and stops as soon as the estimate is
+# at or below the target line, so one compaction buys tens of steps instead of a
+# few. Every text a level lifts out of history is saved under the run's session
+# log directory and the placeholder names that file. An over-window error from
+# the endpoint goes straight to the summarize level and retries the call once.
+# context_window can be overridden per invocation with --context-window.
 #
-# Config invariant: mask_keep_steps x the per-step entry budget plus
-# tail_budget_tokens plus fixed overhead (system + task + summary) must leave
-# headroom under context_window. Defaults: 8 x ~10k tokens + 24k tail + ~1.2k
-# overhead ~= 105k tokens against a 262144 window (~157k headroom).
+# The target line is target = max(target_fraction * context_window, floor) with
+# floor = system prompt + task + keep_tail_tokens: the floor is what compaction
+# cannot remove, so a target under it would only make the ladder run to its end
+# in vain. A floor at or above the window fails at startup; a floor between the
+# threshold line and the window warns once and runs on the over-window path.
 compact:
   context_window: 262144
   threshold_fraction: 0.65
-  mask_keep_steps: 8
+  target_fraction: 0.30
+  # A compaction must buy at least this much space above the target line to be
+  # worth the full re-prefill it causes; below that, history grows instead.
+  min_gain_tokens: 16384
+  # Token cost of one image part when estimating the floor: the base64 length
+  # of an image says nothing about its token count.
+  image_tokens: 1600
+  # Levels to run, in order; removing a level is the retreat when a backend
+  # rejects the rewritten history.
+  ladder: [mask, reasoning, command, summarize]
+  # Verbatim tail the first three levels keep, in tokens, cut on whole-step
+  # boundaries. Replaces the old step-count knob mask_keep_steps.
+  keep_tail_tokens: 15000
+  # Verbatim tail the summarize level keeps when it rebuilds the history.
   tail_budget_tokens: 24000
+  # Head of an old command body kept when the command level elides the rest.
+  command_head_chars: 200
   step_observation_budget_chars: 40000
 
 environment:

@@ -16,13 +16,16 @@ Process governance is two-tier:
 A command that escapes both tiers via an explicit `setsid` (a new session, hence a
 different pgid) leaves harness jurisdiction by design -- that is the documented way
 to start a real background service meant to outlive the run.
+
+Every command's full output is written to the run's session log directory, named
+s-<step>-<call>.log, and never deleted: compaction placeholders point at these
+files, so reading an old observation back never means re-running the command. The
+directory is created by main.py and passed in; nothing is removed at exit.
 """
 
 import os
-import shutil
 import signal
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -43,17 +46,22 @@ def _killpg(pgid):
 
 
 class Environment:
-    def __init__(self, cwd, timeout):
+    def __init__(self, cwd, timeout, log_dir):
         self.cwd = cwd
         self.timeout = timeout
-        self.log_dir = tempfile.mkdtemp(prefix="charlie-code-log-")
+        # The run's session log directory, created by main.py. Command logs and
+        # the texts compaction lifts out of history land here and stay.
+        self.log_dir = str(log_dir)
         self.roster = []
-        self._n_commands = 0
 
-    def execute(self, command):
-        """Run one bash command and return its combined output and exit code."""
-        self._n_commands += 1
-        log_path = os.path.join(self.log_dir, f"cmd-{self._n_commands}.log")
+    def execute(self, command, step, call):
+        """Run one bash command and return its combined output and exit code.
+
+        The full output goes to <log_dir>/s-<step>-<call>.log and stays there
+        after the run, so a compaction placeholder can name it as the way to
+        read the observation back.
+        """
+        log_path = os.path.join(self.log_dir, f"s-{step}-{call}.log")
 
         with open(log_path, "wb") as logf:
             proc = subprocess.Popen(
@@ -75,7 +83,7 @@ class Environment:
             # a raw os.waitpid, which would otherwise leave it a zombie forever
             # (we, not init, are its parent).
             self.roster.append({
-                "pgid": proc.pid, "pid": proc.pid, "logfile": log_path, "proc": proc,
+                "pgid": proc.pid, "pid": proc.pid, "log_path": log_path, "proc": proc,
             })
             output = Path(log_path).read_text(errors="replace")
             marker = (
@@ -85,11 +93,13 @@ class Environment:
                 f"checking back later, and killing it yourself are all equally "
                 f"fine next steps.]"
             )
-            return {"output": output + marker, "returncode": -1}
+            return {"output": output + marker, "returncode": -1,
+                    "log_path": log_path}
 
         time.sleep(_REAP_GRACE_SECONDS)
         _killpg(proc.pid)
-        return {"output": Path(log_path).read_text(errors="replace"), "returncode": returncode}
+        return {"output": Path(log_path).read_text(errors="replace"),
+                "returncode": returncode, "log_path": log_path}
 
     def sweep(self):
         """SIGKILL every registered process group. Call on every controlled exit."""
@@ -97,7 +107,3 @@ class Environment:
             _killpg(job["pgid"])
             job["proc"].wait()
         self.roster = []
-
-    def cleanup_log_dir(self):
-        """Remove this run's log directory. Only safe to call after a clean exit."""
-        shutil.rmtree(self.log_dir)

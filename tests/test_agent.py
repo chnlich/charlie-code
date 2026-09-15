@@ -16,7 +16,8 @@ from environment import Environment
 def _agent(tmp_path, templates, *replies, step_limit=5, emit=None):
     return Agent(
         model=ScriptedModel(*replies),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=templates,
         step_limit=step_limit,
         emit=emit,
@@ -168,7 +169,8 @@ def test_run_finally_sweeps_the_environment_on_success_and_on_failure(tmp_path, 
             self.swept = True
             super().sweep()
 
-    ok_env = SpyEnvironment(cwd=str(tmp_path), timeout=10)
+    ok_env = SpyEnvironment(cwd=str(tmp_path), timeout=10,
+                            log_dir=str(tmp_path))
     Agent(
         model=ScriptedModel(final_answer("done")),
         environment=ok_env,
@@ -177,7 +179,8 @@ def test_run_finally_sweeps_the_environment_on_success_and_on_failure(tmp_path, 
     ).run("finish")
     assert ok_env.swept is True
 
-    fail_env = SpyEnvironment(cwd=str(tmp_path), timeout=10)
+    fail_env = SpyEnvironment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path))
     failing_agent = Agent(
         model=ScriptedModel(assistant(tool_calls=[tool_call(1, command="true")])),
         environment=fail_env,
@@ -249,7 +252,8 @@ def test_resume_replays_stored_system_text_without_rereading_agents_md(
     state_file = tmp_path / "session.json"
     first = Agent(
         model=ScriptedModel(final_answer("done")),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=templates,
         step_limit=5,
         state_file=str(state_file),
@@ -261,7 +265,8 @@ def test_resume_replays_stored_system_text_without_rereading_agents_md(
     agents_md.write_text("changed convention\n", encoding="utf-8")
     resumed = Agent(
         model=ScriptedModel(final_answer("done again")),
-        environment=Environment(cwd=str(tmp_path), timeout=10),
+        environment=Environment(cwd=str(tmp_path), timeout=10,
+                              log_dir=str(tmp_path)),
         templates=templates,
         step_limit=5,
         state_file=str(state_file),

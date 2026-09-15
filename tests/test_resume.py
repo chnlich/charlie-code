@@ -157,9 +157,9 @@ def test_state_file_holds_the_turn_so_far_before_each_risky_step(
         snapshots.setdefault("at_first_query", state_messages())
         return next(responses)
 
-    def execute(self, command):
+    def execute(self, command, step, call):
         snapshots["at_execute"] = state_messages()
-        return {"output": "one\n", "returncode": 0}
+        return {"output": "one\n", "returncode": 0, "log_path": "unused"}
 
     monkeypatch.setattr(Model, "query", query)
     monkeypatch.setattr(

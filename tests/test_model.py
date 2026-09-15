@@ -28,6 +28,67 @@ def test_bash_block_is_preserved_after_leaked_prefix():
     assert strip_leaked_reasoning(content) == "Let me do it.\n```bash\necho hi\n```"
 
 
+class _PromptDetails:
+    def __init__(self, cached_tokens):
+        self.cached_tokens = cached_tokens
+
+
+class _Usage:
+    def __init__(self, prompt, completion, details):
+        self.prompt_tokens = prompt
+        self.completion_tokens = completion
+        self.prompt_tokens_details = details
+
+
+class _UsageResponse:
+    def __init__(self, usage):
+        self.usage = usage
+
+        class _Choice:
+            finish_reason = "stop"
+            message = {"role": "assistant", "content": "hi"}
+
+        self.choices = [_Choice()]
+
+
+def _model_reporting(monkeypatch, usage):
+    monkeypatch.setattr(litellm, "completion", lambda **kwargs: _UsageResponse(usage))
+    model = Model(model_name="m", api_base="http://x/v1", api_key="k",
+                  timeout_seconds=7, stream=False)
+    model.query([{"role": "user", "content": "hi"}])
+    return model
+
+
+def test_usage_accounts_cached_tokens_from_prompt_tokens_details(monkeypatch):
+    model = _model_reporting(
+        monkeypatch, _Usage(82792, 90, _PromptDetails(82742))
+    )
+
+    assert model.last_prompt_tokens == 82792
+    assert model.last_cached_tokens == 82742
+    assert model.cached_tokens == 82742
+    assert model.usage()["cached_tokens"] == 82742
+
+    model = _model_reporting(monkeypatch, _Usage(45, 90, _PromptDetails(50)))
+    assert model.cached_tokens == 50
+
+
+def test_missing_prompt_tokens_details_accounts_zero_cached_tokens(monkeypatch):
+    model = _model_reporting(monkeypatch, _Usage(82, 90, None))
+
+    assert model.last_cached_tokens == 0
+    assert model.cached_tokens == 0
+    assert model.usage()["cached_tokens"] == 0
+
+
+def test_details_without_cached_tokens_accounts_zero(monkeypatch):
+    model = _model_reporting(monkeypatch, _Usage(82, 90, _PromptDetails(None)))
+    assert model.last_cached_tokens == 0
+
+    model = _model_reporting(monkeypatch, _Usage(82, 90, {"cached_tokens": 30}))
+    assert model.last_cached_tokens == 30
+
+
 def test_query_passes_timeout_and_disables_litellms_own_retries(monkeypatch):
     seen = {}
 

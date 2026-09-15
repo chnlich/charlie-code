@@ -4,14 +4,16 @@ Pure functions over the flat message list, used by agent.Agent:
 
 - Entry budget: bound every step's observations before they enter history, so no
   single-step tool burst can blow the window on its own.
-- Mask layer (lossless): replace old tool observations with placeholders that keep
-  the exit code and original length; the command can be re-run to re-read.
-- Tail cutter for the summarize layer: whole steps, newest first, up to a budget;
-  an assistant message and its tool messages are inseparable.
+- Compaction ladder levels: mask old observations, drop old reasoning, elide old
+  command bodies. Each rewrites history in place outside the retained tail and
+  returns the characters it freed; the summarize level (rebuilt history) lives
+  in agent.py because it calls the model. All four share one verbatim tail.
+- Tail cutter: whole steps, newest first, up to a budget; an assistant message
+  and its tool messages are inseparable.
 
 Token estimates here use chars // 4. The agent anchors both the trigger and the
-post-mask estimate to the endpoint's measured usage.prompt_tokens, estimating only
-appended content and the masking delta. Rebuilt history gets a fresh estimate.
+post-level estimates to the endpoint's measured usage.prompt_tokens, subtracting
+only the characters a level freed. Rebuilt history gets a fresh estimate.
 """
 
 import json
@@ -21,23 +23,50 @@ import re
 #: is what makes re-masking idempotent.
 MASK_SENTINEL = "[observation masked by context compaction:"
 
-#: Notes inserted by the per-step entry budget. Both state the original length; the
-#: replacement note also says how to re-read the output.
+#: Marker inside an elided command body. Its presence is what makes re-eliding
+#: idempotent: an already-elided command is left exactly as it is.
+COMMAND_ELISION_MARKER = "[... command body elided;"
+
+#: Note appended to an elided command body. States the file holding the full
+#: text, so reading a command back never means re-running it.
+COMMAND_ELISION_NOTE = "\n[... command body elided; full text: {path} ...]"
+
+#: Notes inserted by the per-step entry budget. Both state the original length
+#: and the file holding the full text; nothing asks the model to re-run a
+#: command, which side effects make false.
 ELISION_NOTE = (
     "\n[... observation truncated by the per-step budget: original was "
-    "{original} chars; head and tail kept ...]\n"
+    "{original} chars; head and tail kept. Full text: {path} ...]\n"
 )
 REPLACEMENT_NOTE = (
     "[observation not recorded: the per-step budget was exhausted; original was "
-    "{original} chars. Re-run the command with filters to re-read it.]"
+    "{original} chars. Full text: {path}.]"
 )
 
 _EXIT_CODE = re.compile(r"Exit code: (-?\d+)")
+_ORIGINAL_CHARS = re.compile(r"original was (\d+) chars")
 
 
-def est_message_chars(message):
-    """Estimated character volume of one message (content + reasoning + calls)."""
-    total = len(message.get("content") or "")
+def est_message_chars(message, image_tokens=0):
+    """Estimated character volume of one message (content + reasoning + calls).
+
+    A parts-list content (a task message carrying images) is summed per part:
+    text parts contribute their length, image parts contribute image_tokens * 4
+    characters - the base64 length of an image says nothing about its token
+    count, so each image counts as the configured constant. Callers estimating
+    a history that can hold the task message pass the configured image_tokens;
+    the default 0 covers step spans, which never carry parts.
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if part.get("type") == "image_url":
+                total += image_tokens * 4
+            else:
+                total += len(part.get("text") or "")
+    else:
+        total = len(content or "")
     total += len(message.get("reasoning_content") or "")
     tool_calls = message.get("tool_calls")
     if tool_calls:
@@ -45,9 +74,17 @@ def est_message_chars(message):
     return total
 
 
-def est_messages_tokens(messages):
+def est_messages_tokens(messages, image_tokens=0):
     """chars/4 estimate of a message list."""
-    return sum(est_message_chars(message) for message in messages) // 4
+    return sum(est_message_chars(message, image_tokens) for message in messages) // 4
+
+
+def original_observation_chars(content):
+    """Original length of a masked observation, stated in its placeholder."""
+    match = _ORIGINAL_CHARS.search(content)
+    if match is None:
+        raise RuntimeError(f"masked observation without an original length: {content!r}")
+    return int(match.group(1))
 
 
 def split_steps(messages):
@@ -70,61 +107,163 @@ def split_steps(messages):
     return spans
 
 
-def bound_observation(observation, remaining):
+def span_ordinals(messages):
+    """Message index -> 1-based step ordinal, for every step's assistant message.
+
+    Every assistant message starts a span, so the map is total over assistant
+    messages; the ordinals are the step numbers the session log directory names
+    files by.
+    """
+    return {
+        start: ordinal
+        for ordinal, (start, _) in enumerate(split_steps(messages), start=1)
+    }
+
+
+def bound_observation(observation, remaining, log_path):
     """Bound one observation to the step's remaining character budget.
 
     Returns (text_for_history, chars_charged). Fits whole when it fits; over the
     remaining budget keeps head and tail halves with an elision note stating the
-    original length and charges exactly `remaining`; when nothing (or too little)
-    is left, the observation is replaced by a one-line note that states the
-    original length and how to re-read it, charging 0. The replacement note lines
-    are the one sanctioned overrun of the step budget: bounded by the number of
-    tool calls in the step, one short line each.
+    original length and the log file holding the full text, charging exactly
+    `remaining`; when nothing (or too little) is left, the observation is
+    replaced by a one-line note that states the original length and the log
+    file, charging 0. The replacement note lines are the one sanctioned overrun
+    of the step budget: bounded by the number of tool calls in the step, one
+    short line each.
     """
     if len(observation) <= remaining:
         return observation, len(observation)
-    note = ELISION_NOTE.format(original=len(observation))
+    if log_path is None:
+        raise RuntimeError(
+            "bounding an observation past the step budget needs the log file "
+            "holding its full text"
+        )
+    note = ELISION_NOTE.format(original=len(observation), path=log_path)
     if remaining > len(note):
         body = remaining - len(note)
         head = body // 2
         tail = body - head
         text = observation[:head] + note + observation[len(observation) - tail:]
         return text, len(text)
-    return REPLACEMENT_NOTE.format(original=len(observation)), 0
+    return REPLACEMENT_NOTE.format(original=len(observation), path=log_path), 0
 
 
-def mask_placeholder(content):
-    """Placeholder for a masked observation: exit code, length, re-read hint."""
+def mask_placeholder(content, log_path):
+    """Placeholder for a masked observation: exit code, original length, and the
+    log file holding the full text, so reading it back never means re-running
+    the command."""
     match = _EXIT_CODE.search(content)
     exit_part = f"; exit code was {match.group(1)}" if match else ""
     return (
-        f"{MASK_SENTINEL} original was {len(content)} chars{exit_part}. "
-        f"Re-run the command (with filters) to re-read it.]"
+        f"{MASK_SENTINEL} original was {len(content)} chars{exit_part}.\n"
+        f" Full text: {log_path}]"
     )
 
 
-def mask_old_observations(messages, keep_steps):
-    """Mask tool observations outside the most recent `keep_steps` steps, in place.
+def mask_old_observations(messages, tail_start, log_paths):
+    """Mask tool observations outside the retained tail, in place.
 
-    Only role=tool `content` fields are rewritten; assistant messages stay
-    byte-identical and tool_call_id pairing is untouched. Already-masked messages
-    are skipped, so repeated passes are idempotent. Returns the number of
-    observations masked in this pass.
+    tail_start is where the verbatim tail begins (verbatim_tail_span at
+    keep_tail_tokens); only tool messages before it are eligible. An observation
+    is replaced only when the placeholder is shorter than what it would replace
+    and the log file holding the full text is known (log_paths maps tool_call_id
+    to path; calls that never executed have no log and stay verbatim, as do
+    observations from earlier runs). Already-masked messages are skipped, so
+    repeated passes are idempotent. Returns the characters freed.
     """
-    spans = split_steps(messages)
-    old_spans = spans[:-keep_steps] if keep_steps else spans
-    masked = 0
-    for start, end in old_spans:
-        for index in range(start, end):
-            message = messages[index]
-            if message.get("role") != "tool":
+    freed = 0
+    for index in range(min(tail_start, len(messages))):
+        message = messages[index]
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        if content.startswith(MASK_SENTINEL):
+            continue
+        log_path = log_paths.get(message.get("tool_call_id"))
+        if log_path is None:
+            continue
+        placeholder = mask_placeholder(content, log_path)
+        if len(placeholder) >= len(content):
+            continue
+        message["content"] = placeholder
+        freed += len(content) - len(placeholder)
+    return freed
+
+
+def drop_old_reasoning(messages, tail_start, save=None):
+    """Delete reasoning_content from assistant messages outside the tail, in place.
+
+    The field is removed outright and no placeholder is left in the body: a
+    placeholder could only go into content, which would pollute the text sent
+    back to the model. `save`, when given, is called as save(text, span_ordinal)
+    with the original text before each drop, so the caller can persist it.
+    Returns the characters freed.
+    """
+    ordinals = span_ordinals(messages)
+    freed = 0
+    for index in range(min(tail_start, len(messages))):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            continue
+        text = message.get("reasoning_content")
+        if not text:
+            continue
+        if save is not None:
+            save(text, ordinals[index])
+        freed += len(text)
+        del message["reasoning_content"]
+    return freed
+
+
+def elide_old_commands(messages, tail_start, head_chars, save):
+    """Elide command bodies in tool_calls of assistant messages outside the tail.
+
+    Every field of a tool_calls entry except `arguments` is preserved
+    byte-for-byte (Gemini signs its thought signature on those fields; a request
+    missing it is rejected). Only the `command` value of a parsed arguments
+    payload is rewritten, keeping its first head_chars characters plus an
+    elision note naming the file holding the full text; every other payload key
+    is carried over. A payload that does not parse, carries no string `command`,
+    was elided by an earlier pass, or would not shrink, is skipped. save is
+    called as save(full_command, span_ordinal, call_index) before each rewrite
+    and returns the path the note names. Returns the characters freed.
+    """
+    ordinals = span_ordinals(messages)
+    freed = 0
+    for index in range(min(tail_start, len(messages))):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls") or []
+        for call_index, call in enumerate(tool_calls, start=1):
+            function = call.get("function")
+            if not isinstance(function, dict):
                 continue
-            content = message.get("content") or ""
-            if content.startswith(MASK_SENTINEL):
+            raw = function.get("arguments")
+            if not isinstance(raw, str):
                 continue
-            message["content"] = mask_placeholder(content)
-            masked += 1
-    return masked
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            command = payload.get("command")
+            if not isinstance(command, str):
+                continue
+            if COMMAND_ELISION_MARKER in command:
+                continue
+            if len(command) <= head_chars:
+                continue
+            path = save(command, ordinals[index], call_index)
+            elided = command[:head_chars] + COMMAND_ELISION_NOTE.format(path=path)
+            new_raw = json.dumps({**payload, "command": elided})
+            if len(new_raw) >= len(raw):
+                continue
+            function["arguments"] = new_raw
+            freed += len(raw) - len(new_raw)
+    return freed
 
 
 def verbatim_tail_span(messages, tail_budget_tokens):
