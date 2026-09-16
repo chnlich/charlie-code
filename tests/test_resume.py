@@ -1,13 +1,16 @@
 import json
 
+import litellm
 import typer
 from typer.testing import CliRunner
 
 import main as cli_main
+import model
 import pytest
 
-from agent import INTERRUPTED_TOOL_RESULT, STATE_PROTOCOL
-from conftest import assistant, final_answer, tool_call
+from agent import INTERRUPTED_TOOL_RESULT, STATE_PROTOCOL, load_config
+from conftest import (FakeCompletionResponse, assistant, final_answer,
+                      service_unavailable, tool_call)
 from environment import Environment
 from model import Model
 
@@ -251,3 +254,65 @@ def test_resuming_a_missing_session_fails_loudly(tmp_path, monkeypatch, task_fil
     assert str(session_dir / "ghost.json") in error["message"]
     assert queries == []
     assert not (session_dir / "ghost.json").exists()
+
+
+def test_retried_model_call_persists_only_the_delivered_reply(
+    tmp_path, monkeypatch, task_file
+):
+    """Failed 503 attempts leave nothing behind: the state file holds the
+    delivered assistant reply exactly once, and a resumed run starts from that
+    history without any phantom message from the failed attempts."""
+    session_dir = tmp_path / "sessions"
+    sentinel = load_config()["agent"]["completion_sentinel"]
+    delivered = FakeCompletionResponse(f"Turn one complete.\n{sentinel}")
+    calls = []
+
+    def first_run_completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            raise service_unavailable()
+        return delivered
+
+    monkeypatch.setattr(litellm, "completion", first_run_completion)
+    monkeypatch.setattr(model, "_sleep", lambda _seconds: None)
+
+    runner = CliRunner()
+    first = runner.invoke(
+        _cli_app(),
+        ["--task-file", task_file("turn one"), "--json", "--no-stream",
+         "--cwd", str(tmp_path), "--session-dir", str(session_dir), "--steps", "2"],
+    )
+
+    assert first.exit_code == 0, first.output
+    assert len(calls) == 3
+    session_id = _json_lines(first.stdout)[0]["session_id"]
+
+    state = json.loads((session_dir / f"{session_id}.json").read_text())
+    assistant_messages = [m for m in state["messages"] if m["role"] == "assistant"]
+    assert len(assistant_messages) == 1
+    assert "Turn one complete." in assistant_messages[0]["content"]
+
+    resumed_calls = []
+
+    def resumed_completion(**kwargs):
+        # Snapshot: kwargs["messages"] is the live list the run keeps appending to.
+        resumed_calls.append([m.copy() for m in kwargs["messages"]])
+        return FakeCompletionResponse(f"Turn two complete.\n{sentinel}")
+
+    monkeypatch.setattr(litellm, "completion", resumed_completion)
+
+    second = runner.invoke(
+        _cli_app(),
+        ["--task-file", task_file("turn two"), "--json", "--no-stream",
+         "--resume", session_id, "--cwd", str(tmp_path),
+         "--session-dir", str(session_dir), "--steps", "2"],
+    )
+
+    assert second.exit_code == 0, second.output
+    assert len(resumed_calls) == 1
+    history = resumed_calls[0]
+    assistants = [m for m in history if m["role"] == "assistant"]
+    assert len(assistants) == 1
+    assert "Turn one complete." in assistants[0]["content"]
+    assert history[-1]["role"] == "user"
+    assert "turn two" in history[-1]["content"]

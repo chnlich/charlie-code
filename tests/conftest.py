@@ -3,6 +3,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,6 +45,36 @@ def final_answer(content, **extra):
 
     sentinel = load_config()["agent"]["completion_sentinel"]
     return assistant(f"{content}\n{sentinel}", **extra)
+
+
+def service_unavailable():
+    """A litellm explicit-HTTP-503: the only exception the request layer retries.
+
+    A fresh instance per call, so tests can assert the last one propagates.
+    """
+    import litellm
+
+    return litellm.exceptions.ServiceUnavailableError(
+        "UNAVAILABLE", llm_provider="openai", model="fake"
+    )
+
+
+class _FakeChoice:
+    def __init__(self, message, finish_reason):
+        self.message = message
+        self.finish_reason = finish_reason
+
+
+class FakeCompletionResponse:
+    """A non-streamed endpoint reply, shaped as Model.query consumes it."""
+
+    def __init__(self, content, prompt_tokens=11, completion_tokens=5):
+        self.choices = [_FakeChoice({"role": "assistant", "content": content}, "stop")]
+        self.usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            prompt_tokens_details=None,
+        )
 
 
 class ScriptedModel:

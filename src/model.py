@@ -31,7 +31,23 @@ Some endpoints still leak reasoning into `content` as an orphan closing `</think
 the message stored in the conversation stays byte-for-byte what the endpoint sent.
 """
 
+import random
+import sys
+import time
+
 import litellm
+
+# Transient-503 retry policy, owned by this request layer: an explicit HTTP 503
+# that arrives before any response fragment is retried at most twice with
+# exponential backoff starting at 30 s and doubling (30 s, then 60 s), each wait
+# plus a random 0-1 s offset to spread concurrent callers. `num_retries=0` keeps
+# litellm's own handler out, so this is the only retry layer.
+_MAX_503_RETRIES = 2
+_RETRY_BACKOFF_SECONDS = 30
+
+# Module-level so tests can inject a recording fake instead of spending 90 real
+# seconds on the backoff waits.
+_sleep = time.sleep
 
 
 def strip_leaked_reasoning(content):
@@ -154,6 +170,19 @@ class Model:
         propagates unchanged for the agent's own handling, and both paths account
         usage the same way.
 
+        An explicit HTTP 503 that arrives before any response fragment is retried
+        here: the same request resent at most twice, waiting 30 s after the first
+        failure and 60 s after the second, each wait plus a random 0-1 s offset.
+        Only litellm's `ServiceUnavailableError` - the exception it raises for a
+        response carrying status 503 - qualifies; timeouts, connection errors,
+        errors after the first streamed chunk, and every other status keep the
+        single-attempt failure path. Each attempt starts from cleared response
+        buffers, and a failed attempt adds no conversation message and no token
+        usage: `n_calls`, the usage counters, and the returned response reflect
+        only the delivered reply. One stderr line per retry names the status code
+        and the attempt number, never request bodies, API keys, or message
+        content.
+
         The streamed rebuild reconstructs tool calls from a fixed field list and
         drops anything else, so every field the raw deltas carried that the
         rebuild does not produce is merged back onto the returned tool calls -
@@ -162,37 +191,61 @@ class Model:
 
         `num_retries=0` is explicit: litellm's OpenAI-compatible handler otherwise
         retries internally (default `max_retries=2`), which would silently triple
-        the cost of a stalled call.
+        the cost of a stalled call - and stack a second retry layer on the 503
+        backoff above.
         """
-        try:
-            if self.stream:
-                stream = litellm.completion(
-                    model=self.model_name,
-                    messages=messages,
-                    tools=tools,
-                    api_base=self.api_base,
-                    api_key=self.api_key,
-                    timeout=self.timeout_seconds,
-                    num_retries=0,
-                    stream=True,
-                    stream_options={"include_usage": True},
+        attempt = 0
+        while True:
+            # Fresh per attempt: a failed attempt leaves no partial response.
+            chunks = []
+            try:
+                if self.stream:
+                    stream = litellm.completion(
+                        model=self.model_name,
+                        messages=messages,
+                        tools=tools,
+                        api_base=self.api_base,
+                        api_key=self.api_key,
+                        timeout=self.timeout_seconds,
+                        num_retries=0,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+                    for chunk in stream:
+                        chunks.append(chunk)
+                    response = litellm.stream_chunk_builder(chunks, messages=messages)
+                else:
+                    response = litellm.completion(
+                        model=self.model_name,
+                        messages=messages,
+                        tools=tools,
+                        api_base=self.api_base,
+                        api_key=self.api_key,
+                        timeout=self.timeout_seconds,
+                        num_retries=0,
+                    )
+            except (litellm.Timeout, litellm.exceptions.MidStreamFallbackError) as exc:
+                # Before the 503 handler: MidStreamFallbackError subclasses
+                # ServiceUnavailableError, and a silent stream - before or after
+                # the first chunk - keeps the single-attempt failure path.
+                raise RuntimeError(
+                    f"model produced no output for {self.timeout_seconds}s"
+                ) from exc
+            except litellm.exceptions.ServiceUnavailableError:
+                # Explicit HTTP 503. Fragments already received (the stream broke
+                # mid-flight) or exhausted retries take the failure path.
+                if chunks or attempt == _MAX_503_RETRIES:
+                    raise
+                wait = _RETRY_BACKOFF_SECONDS * 2 ** attempt + random.uniform(0, 1)
+                print(
+                    f"model request failed with HTTP 503; retrying in {wait:.1f}s"
+                    f" (retry {attempt + 1} of {_MAX_503_RETRIES})",
+                    file=sys.stderr,
                 )
-                chunks = list(stream)
-                response = litellm.stream_chunk_builder(chunks, messages=messages)
+                _sleep(wait)
+                attempt += 1
             else:
-                response = litellm.completion(
-                    model=self.model_name,
-                    messages=messages,
-                    tools=tools,
-                    api_base=self.api_base,
-                    api_key=self.api_key,
-                    timeout=self.timeout_seconds,
-                    num_retries=0,
-                )
-        except (litellm.Timeout, litellm.exceptions.MidStreamFallbackError) as exc:
-            raise RuntimeError(
-                f"model produced no output for {self.timeout_seconds}s"
-            ) from exc
+                break
         self.n_calls += 1
         usage = response.usage
         self.input_tokens += usage.prompt_tokens

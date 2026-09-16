@@ -1,13 +1,16 @@
 import json
 
+import litellm
 import pytest
 import typer
 from litellm.exceptions import ContextWindowExceededError
 from typer.testing import CliRunner
 
 import main as cli_main
+import model
 from agent import Agent, load_config
-from conftest import ScriptedModel, assistant, final_answer, tool_call
+from conftest import (FakeCompletionResponse, ScriptedModel, assistant, final_answer,
+                      service_unavailable, tool_call)
 from environment import Environment
 from model import Model
 
@@ -435,3 +438,59 @@ def test_context_event_without_usage_reports_null_prompt_tokens(tmp_path):
         compact["threshold_fraction"] * compact["context_window"]
     )
     assert event["model"] == "openai/fake-model"
+
+
+def test_transient_503_retries_inside_one_call_and_keeps_the_json_stream_clean(
+    tmp_path, monkeypatch, task_file
+):
+    """A 503 recovered inside Model.query is invisible to the event stream: the
+    delivered reply accounts the usage, and the retry chatter - status code and
+    attempt number only - stays on stderr, never in the stdout JSON events."""
+    sentinel = load_config()["agent"]["completion_sentinel"]
+    delivered = FakeCompletionResponse(f"Done.\n{sentinel}", prompt_tokens=11,
+                                       completion_tokens=5)
+    calls = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            raise service_unavailable()
+        return delivered
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    waits = []
+    monkeypatch.setattr(model, "_sleep", waits.append)
+
+    result = CliRunner().invoke(
+        _cli_app(),
+        [
+            "--task-file", task_file("retry me"),
+            "--json", "--no-stream",
+            "--cwd", str(tmp_path),
+            "--session-dir", str(tmp_path / "sessions"),
+            "--steps", "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 3
+    assert len(waits) == 2
+    # The retry lines never touched stdout: the event stream stays parseable and
+    # shaped exactly like a clean run's.
+    events = _json_lines(result.stdout)
+    assert [event["type"] for event in events] == [
+        "session", "context", "thought", "result",
+    ]
+    assert events[-1]["completed"] is True
+    assert events[-1]["final_output"] == "Done."
+    assert events[-1]["usage"] == {"n_calls": 1, "input_tokens": 11,
+                                   "output_tokens": 5, "cached_tokens": 0}
+    assert events[1]["prompt_tokens"] == 11
+    # One stderr line per retry, naming the status code and the attempt number,
+    # never the task or reply content.
+    stderr_lines = result.stderr.splitlines()
+    assert len(stderr_lines) == 2
+    assert "HTTP 503" in stderr_lines[0] and "retry 1 of 2" in stderr_lines[0]
+    assert "HTTP 503" in stderr_lines[1] and "retry 2 of 2" in stderr_lines[1]
+    assert "retry me" not in result.stderr
+    assert "Done." not in result.stderr

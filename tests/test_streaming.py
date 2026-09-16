@@ -17,10 +17,12 @@ from contextlib import contextmanager
 import litellm
 import pytest
 import typer
-from litellm.exceptions import ContextWindowExceededError
+from litellm.exceptions import (ContextWindowExceededError, InternalServerError,
+                                ServiceUnavailableError)
 from typer.testing import CliRunner
 
 import main as cli_main
+import model
 from agent import Agent, load_config, tool_call_command
 from conftest import ScriptedModel, assistant, final_answer, tool_call
 from environment import Environment
@@ -54,14 +56,16 @@ def delta_chunk(delta):
 
 @contextmanager
 def endpoint(plan, *, nonstream_reply=None, before_headers=0.0, status=200, raw_body=None,
-             requests=None):
+             requests=None, first_errors=()):
     """Serve one OpenAI-compatible reply on 127.0.0.1 at an ephemeral port.
 
     A streamed request is answered with `plan` ((delay, chunk) pairs) as SSE lines
     followed by `data: [DONE]`; a non-streamed request with `nonstream_reply` as one
     JSON body. `before_headers` delays the response status line itself; `status` /
-    `raw_body` replace the reply entirely (error-passthrough cases).
+    `raw_body` replace the reply entirely (error-passthrough cases). `first_errors`
+    serves (status, body) pairs for the first requests, before the normal reply.
     """
+    served = [0]
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -74,6 +78,15 @@ def endpoint(plan, *, nonstream_reply=None, before_headers=0.0, status=200, raw_
                 requests.append(request)
             if before_headers:
                 time.sleep(before_headers)
+            served[0] += 1
+            if served[0] <= len(first_errors):
+                error_status, error_body = first_errors[served[0] - 1]
+                self.send_response(error_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(error_body)))
+                self.end_headers()
+                self.wfile.write(error_body)
+                return
             if status != 200:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -410,3 +423,103 @@ def test_over_window_error_passes_through_as_context_window_exceeded():
         model = Model(model_name="openai/fake", api_base=base, api_key="x", timeout_seconds=5, stream=True)
         with pytest.raises(ContextWindowExceededError):
             model.query([{"role": "user", "content": "hi"}])
+
+
+# The 503 body an overloaded OpenAI-compatible endpoint sends; litellm maps the
+# status line to ServiceUnavailableError regardless of the body's wording.
+OVERLOADED_BODY = json.dumps(
+    {"error": {"message": "UNAVAILABLE", "code": 503}}
+).encode()
+
+
+def _recorded_waits(monkeypatch):
+    """Record the backoff waits instead of spending 90 real seconds sleeping."""
+    waits = []
+    monkeypatch.setattr(model, "_sleep", waits.append)
+    return waits
+
+
+def test_transient_503s_are_retried_and_the_stream_completes(monkeypatch):
+    """503, 503, then a normal stream: three requests, one delivered response,
+    usage accounted once, waits 30 s then 60 s plus 0-1 s jitter."""
+    plan = [(0.0, content_chunk("hello")), (0.0, finish_chunk("stop")),
+            (0.0, usage_chunk(9, 4))]
+    requests = []
+    with endpoint(plan, requests=requests,
+                  first_errors=[(503, OVERLOADED_BODY)] * 2) as base:
+        waits = _recorded_waits(monkeypatch)
+        m = Model(model_name="openai/fake", api_base=base, api_key="x",
+                  timeout_seconds=5, stream=True)
+        message, finish_reason = m.query([{"role": "user", "content": "hi"}])
+
+    assert message == {"role": "assistant", "content": "hello"}
+    assert finish_reason == "stop"
+    assert len(requests) == 3
+    assert m.n_calls == 1
+    assert m.input_tokens == 9
+    assert m.output_tokens == 4
+    assert 30 <= waits[0] <= 31
+    assert 60 <= waits[1] <= 61
+
+
+def test_persistent_503_propagates_after_exactly_three_requests(monkeypatch):
+    requests = []
+    with endpoint([], first_errors=[(503, OVERLOADED_BODY)] * 5,
+                  requests=requests) as base:
+        waits = _recorded_waits(monkeypatch)
+        m = Model(model_name="openai/fake", api_base=base, api_key="x",
+                  timeout_seconds=5, stream=True)
+        with pytest.raises(ServiceUnavailableError):
+            m.query([{"role": "user", "content": "hi"}])
+
+    assert len(requests) == 3
+    assert len(waits) == 2
+
+
+def test_non_streaming_transient_503_is_retried(monkeypatch):
+    """The non-streaming path shares the policy: 503 once, then the endpoint's
+    message arrives whole and accounted."""
+    requests = []
+    with endpoint([], nonstream_reply=TOOLCALL_NONSTREAM, requests=requests,
+                  first_errors=[(503, OVERLOADED_BODY)]) as base:
+        waits = _recorded_waits(monkeypatch)
+        m = Model(model_name="openai/fake", api_base=base, api_key="x",
+                  timeout_seconds=5, stream=False)
+        message, finish_reason = m.query([{"role": "user", "content": "hi"}])
+
+    assert message["tool_calls"][0]["id"] == "call-1"
+    assert finish_reason == "tool_calls"
+    assert len(requests) == 2
+    assert all(not request.get("stream") for request in requests)
+    assert m.n_calls == 1
+    assert 30 <= waits[0] <= 31
+
+
+def test_mid_stream_silence_is_never_retried(monkeypatch):
+    """A break after the first chunk keeps the single-attempt failure path:
+    exactly one request, no backoff wait, the same RuntimeError."""
+    plan = [(0.05, content_chunk("a")), (1.5, content_chunk("b"))]
+    requests = []
+    with endpoint(plan, requests=requests) as base:
+        waits = _recorded_waits(monkeypatch)
+        m = Model(model_name="openai/fake", api_base=base, api_key="x",
+                  timeout_seconds=0.5, stream=True)
+        with pytest.raises(RuntimeError, match="no output for 0.5s"):
+            m.query([{"role": "user", "content": "hi"}])
+
+    assert len(requests) == 1
+    assert waits == []
+
+
+def test_non_503_error_status_is_never_retried(monkeypatch):
+    requests = []
+    with endpoint([], status=500, raw_body=b'{"error": {"message": "boom"}}',
+                  requests=requests) as base:
+        waits = _recorded_waits(monkeypatch)
+        m = Model(model_name="openai/fake", api_base=base, api_key="x",
+                  timeout_seconds=5, stream=True)
+        with pytest.raises(InternalServerError):
+            m.query([{"role": "user", "content": "hi"}])
+
+    assert len(requests) == 1
+    assert waits == []
