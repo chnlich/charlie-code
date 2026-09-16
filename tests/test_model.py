@@ -1,15 +1,19 @@
-"""Unit tests for client-side reasoning-leak stripping and the model-call gate.
-
-No network is touched: litellm.completion is monkeypatched throughout.
+"""Unit tests for client-side reasoning-leak stripping, the model-call gate,
+and the optional top_p/temperature sampling knobs: Model forwarding, plus the
+CLI / environment / config resolution in main. No network is touched:
+litellm.completion is monkeypatched throughout.
 """
 
 import time
 
 import litellm
 import pytest
+import typer
+from typer.testing import CliRunner
 
+import main as cli_main
 import model
-from conftest import service_unavailable
+from conftest import final_answer, service_unavailable
 from model import Model, strip_leaked_reasoning
 
 
@@ -375,3 +379,207 @@ def test_503_after_the_first_chunk_is_never_retried(monkeypatch):
 
     assert len(calls) == 1
     assert waits == []
+
+
+# --- Optional sampling knobs: top_p / temperature -----------------------------
+
+
+def test_model_stores_sampling_knobs():
+    m = Model("openai/test", "http://localhost", "key", 10, True,
+              top_p=0.95, temperature=0.7)
+    assert m.top_p == 0.95
+    assert m.temperature == 0.7
+
+
+def _recording_model(monkeypatch, stream, **model_kwargs):
+    """A Model wired to a recording fake litellm.completion that then fails the
+    call, so tests can inspect the exact request kwargs without a network."""
+    seen = {}
+
+    def fake_completion(**kwargs):
+        seen.update(kwargs)
+        raise TimeoutError("endpoint stalled")
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    m = Model(model_name="m", api_base="http://x/v1", api_key="k",
+              timeout_seconds=7, stream=stream, **model_kwargs)
+    with pytest.raises(TimeoutError):
+        m.query([{"role": "user", "content": "hi"}])
+    return m, seen
+
+
+def test_sampling_knobs_are_forwarded_on_both_call_paths(monkeypatch):
+    for stream in (False, True):
+        _, seen = _recording_model(monkeypatch, stream, top_p=0.95, temperature=0.7)
+        assert seen["top_p"] == 0.95
+        assert seen["temperature"] == 0.7
+
+
+def test_unset_sampling_knobs_are_forwarded_as_none(monkeypatch):
+    """None is the deliberate "endpoint default" wire state: litellm treats None
+    as the OpenAI default and keeps the field out of the request body."""
+    _, seen = _recording_model(monkeypatch, stream=True)
+    assert seen["top_p"] is None
+    assert seen["temperature"] is None
+
+
+def _invoke_cli(tmp_path, monkeypatch, task_path, argv=()):
+    """Run main.run in-process with Model faked; return (result, the kwargs the
+    Model was constructed with)."""
+    recorded = {}
+    real_init = Model.__init__
+
+    def init(self, **kwargs):
+        recorded.update(kwargs)
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(Model, "__init__", init)
+    monkeypatch.setattr(Model, "query",
+                        lambda self, messages, tools=None: final_answer("done"))
+    monkeypatch.setattr(
+        Model, "usage",
+        lambda self: {"n_calls": 1, "input_tokens": 2, "output_tokens": 3},
+    )
+    app = typer.Typer()
+    app.command()(cli_main.run)
+    result = CliRunner().invoke(
+        app,
+        ["--task-file", str(task_path), "--json", "--cwd", str(tmp_path),
+         "--session-dir", str(tmp_path / "sessions"), "--steps", "1", *argv],
+    )
+    return result, recorded
+
+
+def test_cli_flags_reach_the_model(tmp_path, monkeypatch, task_file):
+    result, recorded = _invoke_cli(
+        tmp_path, monkeypatch, task_file("do it"),
+        ["--top-p", "0.9", "--temperature", "0.5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] == 0.9
+    assert recorded["temperature"] == 0.5
+
+
+def test_defaults_are_none_when_nothing_overrides_the_config(
+    tmp_path, monkeypatch, task_file
+):
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"))
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] is None
+    assert recorded["temperature"] is None
+
+
+def test_environment_variables_reach_the_model(tmp_path, monkeypatch, task_file):
+    monkeypatch.setenv("CHARLIE_CODE_TOP_P", "0.8")
+    monkeypatch.setenv("CHARLIE_CODE_TEMPERATURE", "0.2")
+
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"))
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] == 0.8
+    assert recorded["temperature"] == 0.2
+
+
+def test_cli_flag_beats_environment_variable(tmp_path, monkeypatch, task_file):
+    monkeypatch.setenv("CHARLIE_CODE_TOP_P", "0.8")
+    monkeypatch.setenv("CHARLIE_CODE_TEMPERATURE", "0.2")
+
+    result, recorded = _invoke_cli(
+        tmp_path, monkeypatch, task_file("do it"),
+        ["--top-p", "0.9", "--temperature", "0.5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] == 0.9
+    assert recorded["temperature"] == 0.5
+
+
+def test_environment_variable_beats_config_value(tmp_path, monkeypatch, task_file):
+    real_load_config = cli_main.load_config
+
+    def load_with_configured_knobs():
+        config = real_load_config()
+        config["model"]["top_p"] = 0.9
+        config["model"]["temperature"] = 0.6
+        return config
+
+    monkeypatch.setattr(cli_main, "load_config", load_with_configured_knobs)
+    monkeypatch.setenv("CHARLIE_CODE_TOP_P", "0.33")
+
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"))
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] == 0.33
+    assert recorded["temperature"] == 0.6
+
+
+def test_blank_environment_variable_counts_as_unset(tmp_path, monkeypatch, task_file):
+    monkeypatch.setenv("CHARLIE_CODE_TOP_P", "   ")
+    monkeypatch.setenv("CHARLIE_CODE_TEMPERATURE", "")
+
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"))
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] is None
+    assert recorded["temperature"] is None
+
+
+def test_non_numeric_environment_value_is_a_parameter_error(
+    tmp_path, monkeypatch, task_file
+):
+    monkeypatch.setenv("CHARLIE_CODE_TOP_P", "half")
+
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"))
+
+    assert result.exit_code == 2
+    assert "CHARLIE_CODE_TOP_P" in result.output
+    assert not recorded
+
+
+@pytest.mark.parametrize("value", ["0", "0.0", "-0.5", "1.01", "2"])
+def test_top_p_outside_the_inclusive_unit_interval_is_a_parameter_error(
+    tmp_path, monkeypatch, task_file, value
+):
+    def bomb(**kwargs):
+        raise AssertionError("model called despite an invalid --top-p")
+
+    monkeypatch.setattr(litellm, "completion", bomb)
+
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"),
+                                   ["--top-p", value])
+
+    assert result.exit_code == 2
+    assert "--top-p" in result.output
+    assert not recorded
+
+
+@pytest.mark.parametrize("value", ["-0.1", "-5"])
+def test_negative_temperature_is_a_parameter_error(
+    tmp_path, monkeypatch, task_file, value
+):
+    def bomb(**kwargs):
+        raise AssertionError("model called despite an invalid --temperature")
+
+    monkeypatch.setattr(litellm, "completion", bomb)
+
+    result, recorded = _invoke_cli(tmp_path, monkeypatch, task_file("do it"),
+                                   ["--temperature", value])
+
+    assert result.exit_code == 2
+    assert "--temperature" in result.output
+    assert not recorded
+
+
+@pytest.mark.parametrize("top_p, temperature", [("1", "0"), ("0.0001", "0")])
+def test_boundary_values_are_accepted(tmp_path, monkeypatch, task_file,
+                                      top_p, temperature):
+    result, recorded = _invoke_cli(
+        tmp_path, monkeypatch, task_file("do it"),
+        ["--top-p", top_p, "--temperature", temperature],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert recorded["top_p"] == float(top_p)
+    assert recorded["temperature"] == float(temperature)

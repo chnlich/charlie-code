@@ -8,6 +8,11 @@ reasoning knobs: endpoints separate reasoning server-side and strict OpenAI-comp
 layers reject unknown fields, which is why the old `extra_body={"separate_reasoning":
 True}` was removed.
 
+The optional sampling knobs `top_p` and `temperature` are forwarded to
+litellm.completion on both call paths. None means "endpoint default": litellm
+treats None as the OpenAI default and keeps the field out of the request body,
+so an unset knob changes nothing about what is sent.
+
 The call runs in one of two modes, selected by `stream`. Streaming (the
 default) reads the chunks to the end here and reassembles them with
 `litellm.stream_chunk_builder`, so the caller still receives one whole message;
@@ -139,7 +144,8 @@ def merge_stream_tool_call_fields(message, chunks):
 
 
 class Model:
-    def __init__(self, model_name, api_base, api_key, timeout_seconds, stream):
+    def __init__(self, model_name, api_base, api_key, timeout_seconds, stream,
+                 top_p=None, temperature=None):
         self.model_name = model_name
         self.api_base = api_base
         self.api_key = api_key
@@ -147,6 +153,11 @@ class Model:
         # chunks when streaming, the whole-call bound when not.
         self.timeout_seconds = timeout_seconds
         self.stream = stream
+        # Optional sampling knobs, forwarded to litellm.completion on both call
+        # paths. None means "endpoint default": litellm treats None as the
+        # OpenAI default and keeps the field out of the request body.
+        self.top_p = top_p
+        self.temperature = temperature
         self.n_calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
@@ -207,6 +218,8 @@ class Model:
                         api_base=self.api_base,
                         api_key=self.api_key,
                         timeout=self.timeout_seconds,
+                        top_p=self.top_p,
+                        temperature=self.temperature,
                         num_retries=0,
                         stream=True,
                         stream_options={"include_usage": True},
@@ -222,6 +235,8 @@ class Model:
                         api_base=self.api_base,
                         api_key=self.api_key,
                         timeout=self.timeout_seconds,
+                        top_p=self.top_p,
+                        temperature=self.temperature,
                         num_retries=0,
                     )
             except (litellm.Timeout, litellm.exceptions.MidStreamFallbackError) as exc:

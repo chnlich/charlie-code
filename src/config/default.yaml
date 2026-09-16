@@ -10,6 +10,12 @@ model:
   # streaming, the whole-call bound when not.
   stream: true
   timeout_seconds: 1200
+  # Optional sampling knobs, forwarded to litellm.completion. null keeps the
+  # field out of the request body, so the endpoint's own default applies.
+  # Overridable per invocation with --top-p / --temperature or the
+  # CHARLIE_CODE_TOP_P / CHARLIE_CODE_TEMPERATURE environment variables.
+  top_p: null
+  temperature: null
 
 agent:
   step_limit: 1000

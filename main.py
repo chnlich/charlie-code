@@ -91,6 +91,22 @@ def _validate_images(images):
     return list(images)
 
 
+def _env_float(name):
+    """The float value of an environment variable, or None when unset or blank.
+
+    A blank value counts as unset (a harness may export an empty placeholder);
+    a set-but-unparsable value is a parameter error naming the variable, never
+    a silent fallback to the config default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise typer.BadParameter(f"{name}: {raw!r} is not a valid float.") from None
+
+
 def _print_log_retention(environment):
     print(f"Command logs retained at: {environment.log_dir}", file=sys.stderr)
 
@@ -182,6 +198,16 @@ def run(
         help="Model-call budget passed to litellm as `timeout`: the silence bound "
         "between streamed chunks when streaming, the whole-call bound when not.",
     ),
+    top_p: float | None = typer.Option(
+        None,
+        "--top-p",
+        help="Nucleus sampling threshold in (0.0, 1.0].",
+    ),
+    temperature: float | None = typer.Option(
+        None,
+        "--temperature",
+        help="Sampling temperature >= 0.0.",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -206,6 +232,10 @@ def run(
             f"--timeout-seconds must be a positive integer (seconds), "
             f"got {timeout_seconds}."
         )
+    if top_p is not None and not (0.0 < top_p <= 1.0):
+        raise typer.BadParameter(f"--top-p must be in (0.0, 1.0], got {top_p}.")
+    if temperature is not None and temperature < 0.0:
+        raise typer.BadParameter(f"--temperature must be >= 0.0, got {temperature}.")
 
     config = load_config()
     if context_window is not None:
@@ -223,6 +253,20 @@ def run(
         stream = config["model"]["stream"]
     if timeout_seconds is None:
         timeout_seconds = config["model"]["timeout_seconds"]
+    # Sampling knobs, resolved CLI > environment > config > None. None keeps the
+    # field out of the request body: litellm treats None as the OpenAI default.
+    env_top_p = _env_float("CHARLIE_CODE_TOP_P")
+    env_temperature = _env_float("CHARLIE_CODE_TEMPERATURE")
+    resolved_top_p = (
+        top_p if top_p is not None
+        else env_top_p if env_top_p is not None
+        else config["model"].get("top_p")
+    )
+    resolved_temperature = (
+        temperature if temperature is not None
+        else env_temperature if env_temperature is not None
+        else config["model"].get("temperature")
+    )
     working_dir = cwd or os.getcwd()
     # Skill roots, repo level first so a repo skill wins a name collision: the repo
     # directories under the git worktree root that contains the working directory
@@ -260,6 +304,8 @@ def run(
             api_key=api_key,
             timeout_seconds=timeout_seconds,
             stream=stream,
+            top_p=resolved_top_p,
+            temperature=resolved_temperature,
         ),
         environment=Environment(
             cwd=working_dir,
