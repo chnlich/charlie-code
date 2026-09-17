@@ -182,7 +182,7 @@ def run(
     context_window: int = typer.Option(
         None,
         "--context-window",
-        help="Compaction context-window override, in tokens, for this invocation.",
+        help="Context-window override, in tokens, for this invocation; the reset threshold scales with it.",
     ),
     stream: bool | None = typer.Option(
         None,
@@ -287,9 +287,10 @@ def run(
     os.makedirs(resolved_session_dir, exist_ok=True)
     session_id = resume or str(uuid.uuid4())
     state_file = os.path.join(resolved_session_dir, f"{session_id}.json")
-    # Run-scoped session log directory: command logs and every text compaction
-    # lifts out of history live here, keyed by run start so a resumed run never
-    # overwrites an earlier run's files. Nothing is deleted at exit.
+    # Run-scoped session log directory: command logs live here, keyed by run
+    # start so a resumed run never overwrites an earlier run's files; the
+    # session's transcript sits one level up, in <session id>.d. Nothing is
+    # deleted at exit.
     run_started_at = datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y%m%dT%H%M%SZ"
     )

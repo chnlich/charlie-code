@@ -21,9 +21,10 @@ jurisdiction by design -- that is the documented way to start a real background
 service meant to outlive the run.
 
 Every command's full output is written to the run's session log directory, named
-s-<step>-<call>.log, and never deleted: compaction placeholders point at these
-files, so reading an old observation back never means re-running the command. The
-directory is created by main.py and passed in; nothing is removed at exit.
+s-<step>-<call>.log, and never deleted: the transcript's result stubs point at
+these files, so reading an old observation back never means re-running the
+command. The directory is created by main.py and passed in; nothing is removed at
+exit.
 """
 
 import os
@@ -74,8 +75,8 @@ class Environment:
         self.cwd = cwd
         self.progress_notices_seconds = list(progress_notices_seconds)
         self.kill_after_seconds = kill_after_seconds
-        # The run's session log directory, created by main.py. Command logs and
-        # the texts compaction lifts out of history land here and stay.
+        # The run's session log directory, created by main.py. Command logs land
+        # here and stay.
         self.log_dir = str(log_dir)
         # Sink for command_progress events; Agent hands its own emit over so the
         # progress of a command lands in the same stream as its command event.
@@ -87,7 +88,7 @@ class Environment:
         """Run one bash command and return its combined output and exit code.
 
         The full output goes to <log_dir>/s-<step>-<call>.log and stays there
-        after the run, so a compaction placeholder can name it as the way to
+        after the run, so the transcript's stub line can name it as the way to
         read the observation back. A command still running at the cap is
         terminated and its output gets the termination note appended.
         """

@@ -29,44 +29,22 @@ agent:
   # rather than the whole step limit. Any reply carrying a tool call resets it.
   unfinished_reply_limit: 3
 
-# Layered context compaction. Every observation entering history is bounded by the
-# per-step entry budget. At a step boundary whose measured prompt tokens (plus a
-# chars/4 estimate of what was appended since) reach threshold_fraction *
-# context_window AND stand at least min_gain_tokens above the target line, the
-# ladder runs in order - mask old observations, drop old reasoning, elide old
-# command bodies, rebuild from a summary - and stops as soon as the estimate is
-# at or below the target line, so one compaction buys tens of steps instead of a
-# few. Every text a level lifts out of history is saved under the run's session
-# log directory and the placeholder names that file. An over-window error from
-# the endpoint goes straight to the summarize level and retries the call once.
+# Context reset. Every command's output is bounded on its own before it enters
+# the context (command_observation_chars: head and tail halves around a one-line
+# marker stating the full output's totals). History is append-only and never
+# rewritten. Before each model call the agent estimates the context as the last
+# measured prompt_tokens plus chars/4 of what was appended since (chars/4 of the
+# whole context when there is no measurement yet); at or above
+# threshold_fraction * context_window it rebuilds the context as three messages:
+# the system message, a one-line pointer to the session's transcript and command
+# log directory (templates.reset_pointer), and this turn's task. Older material
+# stays on disk and the model reads it back with rg. An over-window error from
+# the endpoint runs the same reset and retries the call once.
 # context_window can be overridden per invocation with --context-window.
-#
-# The target line is target = max(target_fraction * context_window, floor) with
-# floor = system prompt + task + keep_tail_tokens: the floor is what compaction
-# cannot remove, so a target under it would only make the ladder run to its end
-# in vain. A floor at or above the window fails at startup; a floor between the
-# threshold line and the window warns once and runs on the over-window path.
 compact:
-  context_window: 262144
-  threshold_fraction: 0.65
-  target_fraction: 0.30
-  # A compaction must buy at least this much space above the target line to be
-  # worth the full re-prefill it causes; below that, history grows instead.
-  min_gain_tokens: 16384
-  # Token cost of one image part when estimating the floor: the base64 length
-  # of an image says nothing about its token count.
-  image_tokens: 1600
-  # Levels to run, in order; removing a level is the retreat when a backend
-  # rejects the rewritten history.
-  ladder: [mask, reasoning, command, summarize]
-  # Verbatim tail the first three levels keep, in tokens, cut on whole-step
-  # boundaries. Replaces the old step-count knob mask_keep_steps.
-  keep_tail_tokens: 15000
-  # Verbatim tail the summarize level keeps when it rebuilds the history.
-  tail_budget_tokens: 24000
-  # Head of an old command body kept when the command level elides the rest.
-  command_head_chars: 200
-  step_observation_budget_chars: 40000
+  context_window: 262144           # model window in tokens; --context-window overrides per invocation
+  threshold_fraction: 0.65         # reset when the estimate reaches threshold_fraction * context_window
+  command_observation_chars: 5000  # per-command cap on the output entering the context: head and tail halves around a one-line total marker
 
 environment:
   # Seconds after which a running command reports progress (a command_progress
@@ -138,29 +116,8 @@ templates:
     Either call the `bash` tool with the next command, or send the complete final
     answer again, ending with that line.
 
-  compact_prompt: |
-    You are compacting the conversation of an autonomous software engineering
-    agent (your own session) to fit the model context window. The conversation
-    above is the full session so far. After compaction, the most recent messages
-    remain available verbatim, so do NOT restate their detail; summarize what is
-    not in them. If the conversation already contains an earlier summary, inherit
-    every fact in it that is still valid.
-
-    Write a structured handoff summary with exactly these five sections:
-    1. Progress and decisions: what has been accomplished and which decisions
-       were made, including the reasons behind non-obvious ones.
-    2. Unresolved issues: problems still open, with what is known about each.
-    3. Attempted and failed paths: approaches already tried that did not work,
-       so they are not retried.
-    4. Key paths and commands: file paths, commands, and other concrete handles
-       the remaining work depends on.
-    5. Remaining steps: what still has to happen to complete the task.
-
-    Be terse and factual. Reply with the summary only, as plain text.
-
-  compact_summary_prefix: |
-    Another model has summarized the session so far to fit the context window.
-    Its summary follows; the messages after it are the most recent steps, kept
-    verbatim.
-
-    Summary of the session so far:
+  # The one user message a rebuilt context carries besides the task. Rendered
+  # once per session from the transcript's absolute path and the session's .d
+  # directory (command logs, one file per command), so it is byte-identical for
+  # the whole session.
+  reset_pointer: "Prior context: {{transcript}}; command outputs under {{session_dir}}/. Use rg."

@@ -182,5 +182,5 @@ def test_command_log_is_written_to_the_given_dir_and_never_deleted(tmp_path):
 
     assert result == {"output": "hello\n", "returncode": 0,
                       "log_path": str(log_dir / "s-3-2.log")}
-    # Session logs are never removed: compaction placeholders point at them.
+    # Session logs are never removed: the transcript stubs point at them.
     assert (log_dir / "s-3-2.log").read_text() == "hello\n"

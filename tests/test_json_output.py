@@ -299,14 +299,7 @@ def test_context_event_threshold_is_fraction_times_window_for_the_config_in_use(
     compact = {
         "context_window": 10000,
         "threshold_fraction": 0.5,
-        "target_fraction": 0.3,
-        "min_gain_tokens": 16384,
-        "image_tokens": 1600,
-        "ladder": ["mask", "reasoning", "command", "summarize"],
-        "keep_tail_tokens": 300,
-        "tail_budget_tokens": 24000,
-        "command_head_chars": 200,
-        "step_observation_budget_chars": 40000,
+        "command_observation_chars": 5000,
     }
     events = []
     agent = Agent(
@@ -383,14 +376,12 @@ def test_context_event_carries_the_cached_tokens_the_endpoint_reported(tmp_path)
 
 
 def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
-    s_summary = assistant("1. Progress: nothing yet. 5. Remaining: everything.")
     s_done = final_answer("finished after retry")
     events = []
     agent = Agent(
         model=UsageModel(
             (OVERFLOW, None),   # original call: over-window
-            (s_summary, 700),   # compaction summary call
-            (s_done, 900),      # retried conversation call
+            (s_done, 900),      # retried call on the rebuilt context
         ),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
@@ -409,7 +400,7 @@ def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
     event = events[context_index]
     assert event["step"] == 1
     assert event["prompt_tokens"] == 900
-    # The overflow compaction's compact event precedes the step's context event.
+    # The overflow reset's compact event precedes the step's context event.
     assert "compact" in types[:context_index]
 
 

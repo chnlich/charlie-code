@@ -162,7 +162,7 @@ class Model:
         self.input_tokens = 0
         self.output_tokens = 0
         self.cached_tokens = 0
-        # prompt_tokens of the most recent call; the compaction trigger's anchor.
+        # prompt_tokens of the most recent call; the reset trigger's anchor.
         self.last_prompt_tokens = None
         # cached_tokens of the most recent call, for the per-step context event.
         self.last_cached_tokens = 0

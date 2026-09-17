@@ -110,7 +110,7 @@ def resolve_model(models_cfg, logical_id, env_file=DEFAULT_ENV_FILE, env=None):
         "api_base": resolved[entry["base_env"]],
         "api_key": api_key,
     }
-    # Optional per-model compaction window override: an env var NAME from the
+    # Optional per-model context-window override: an env var NAME from the
     # registry (never a value). Set -> parsed int >= 1; unset -> the flag is
     # not passed and charlie-code's packaged default applies.
     window_env = entry.get("window_env")

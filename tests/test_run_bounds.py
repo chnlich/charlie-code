@@ -51,7 +51,7 @@ def _spy_environments(monkeypatch):
 
 
 def test_session_log_dir_is_kept_after_a_successful_run(tmp_path, monkeypatch, task_file):
-    """Command logs are never deleted: compaction placeholders point at them,
+    """Command logs are never deleted: the transcript stubs point at them,
     so a clean exit retains the run's directory like a failed one does."""
     created = _spy_environments(monkeypatch)
 

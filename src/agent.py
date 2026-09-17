@@ -7,22 +7,24 @@ the reply's last line is the completion sentinel and an answer stands above it.
 Shape alone never proves completion, because a truncated reply looks exactly like
 a finished one; a sentinel cannot be truncated into existence.
 
-To keep long sessions alive near the context window, the loop compacts history
-with a ladder (see compact.py): a per-step entry budget bounds every step's
-observations before they enter history; at a step boundary whose
-measured-plus-estimated size reaches the threshold line and buys at least
-min_gain_tokens above the target line, the ladder runs mask old observations,
-drop old reasoning, elide old command bodies, and summarize in order, stopping
-once the estimate is at or below the target line. Every rewritten text is saved
-under the run's session log directory and its placeholder names that file, so
-nothing is lost and no placeholder asks the model to re-run a command. An
-over-window error from the endpoint goes straight to the summarize level and
-retries the call once instead of killing the session.
+History is append-only: a message that has been sent is never rewritten, so the
+prompt prefix stays byte-identical from one call to the next and the endpoint's
+prefix cache keeps hitting. Each command's output is bounded on its own before it
+enters the context (see compact.py). Before every model call the agent estimates
+the context from the last measured prompt_tokens plus chars/4 of what was appended
+since; at or above threshold_fraction * context_window it rebuilds the context as
+three messages, the system message, a one-line pointer to the session's transcript
+and command log directory, and this turn's task, and the older material stays on
+disk: the transcript (transcript.py) holds every message the model saw, the
+per-command log files hold the full outputs, and the model reads them back with
+rg. An over-window error from the endpoint runs the same reset and retries the
+call once instead of killing the session.
 
-Every message enters history through `Agent._append_message`, which rewrites the
-session state file atomically on each append: a process killed at any moment
-(SIGTERM from a manual stop, SIGKILL, OOM) loses at most the message in flight,
-and resuming such a file first answers any tool call the kill left unanswered.
+Every message enters history through `Agent._append_message`, which appends the
+transcript record and then rewrites the session state file atomically: a process
+killed at any moment (SIGTERM from a manual stop, SIGKILL, OOM) loses at most the
+message in flight, and resuming such a file first answers any tool call the kill
+left unanswered.
 """
 
 import base64
@@ -35,16 +37,9 @@ from pathlib import Path
 import yaml
 from litellm.exceptions import ContextWindowExceededError
 
-from compact import (
-    bound_observation,
-    drop_old_reasoning,
-    drop_oldest_middle_half,
-    elide_old_commands,
-    est_messages_tokens,
-    mask_old_observations,
-    verbatim_tail_span,
-)
+from compact import est_messages_tokens, truncate_observation
 from model import strip_leaked_reasoning
+from transcript import Transcript
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
 
@@ -93,30 +88,6 @@ CONTROL_MARKERS = (
 
 def load_config(path=DEFAULT_CONFIG_PATH):
     return yaml.safe_load(Path(path).read_text())
-
-
-def _rewrite_fingerprints(messages):
-    """References to the values a ladder level can rewrite, one entry per
-    message: (content, reasoning_content, [tool_calls arguments]).
-
-    The levels mutate messages in place, so comparing message dicts against a
-    snapshot would compare a dict with itself. Comparing these value
-    references instead: an untouched message holds the same objects, a
-    rewritten one holds new strings or has lost the reasoning field. Holding
-    the pre-pass references keeps them alive, so identity is decisive.
-    """
-    return [
-        (
-            message.get("content"),
-            message.get("reasoning_content"),
-            [
-                call["function"].get("arguments")
-                if isinstance(call.get("function"), dict) else None
-                for call in (message.get("tool_calls") or [])
-            ],
-        )
-        for message in messages
-    ]
 
 
 def render(template, **values):
@@ -304,16 +275,23 @@ class Agent:
         self.compact = compact if compact is not None else load_config()["compact"]
         self.images = list(images)
         self.messages = []
+        # This turn's task message: the third message of every rebuilt context.
+        self._task = None
         # len(self.messages) at the last successful model query: messages after it
         # are what the last measured prompt_tokens does not yet account for. None
-        # right after a compaction, until the next query re-anchors the estimate.
+        # right after a reset, until the next query re-anchors the estimate.
         self._last_query_index = None
-        # tool_call_id -> log file holding the command's full output, for the
-        # observations this run appended. Masking points placeholders at these
-        # files; observations inherited from an earlier run have no entry here.
-        self._observation_logs = {}
-        # Step number of the last compaction, for steps_since_last_compact.
-        self._last_compact_step = 0
+        # The session's disk directory <session id>.d (command logs per run, the
+        # transcript at its top) derives from the state file; the pointer message
+        # names both. Without a state file there is nothing to resume and no
+        # transcript; the directory then follows the executor's log directory.
+        if state_file is not None:
+            state_path = Path(state_file)
+            self.session_dir = state_path.with_suffix(".d")
+            self.transcript = Transcript(self.session_dir / "transcript.md", state_path.stem)
+        else:
+            self.session_dir = Path(self.environment.log_dir).parent
+            self.transcript = None
 
     def _initial_messages(self):
         """History before this turn's task message.
@@ -331,7 +309,9 @@ class Agent:
                     f"Cannot resume: session state file {state_path} does not exist."
                 )
             messages = _load_state(state_path)
-            repair_dangling_tool_calls(messages)
+            added = repair_dangling_tool_calls(messages)
+            for _ in range(added):
+                self._record(Transcript.interrupted_stub())
             return messages
 
         system = render(
@@ -346,14 +326,21 @@ class Agent:
             system += "\n\n" + agents_md
         return [{"role": "system", "content": system}]
 
-    def _append_message(self, message):
-        """The one way a message enters history: append, then persist.
+    def _record(self, record):
+        """Append one transcript record, when this session keeps a transcript."""
+        if self.transcript is not None and record:
+            self.transcript.append(record)
 
-        Persisting on every append bounds what a kill at any moment can lose to
-        the message being produced; the file on disk is otherwise always the
-        complete history so far.
+    def _append_message(self, message, record=None):
+        """The one way a message enters history: append, record, then persist.
+
+        The transcript record goes first, so the transcript is never behind the
+        context a kill leaves on disk. Persisting on every append bounds what a
+        kill at any moment can lose to the message being produced; the file on
+        disk is otherwise always the complete history so far.
         """
         self.messages.append(message)
+        self._record(record)
         self._persist_messages()
 
     def _persist_messages(self):
@@ -374,30 +361,38 @@ class Agent:
 
         os.replace(tmp_path, state_path)
 
+    def _pointer_message(self):
+        """The one-line pointer a rebuilt context carries: the transcript path
+        and the command log directory, rendered the same way for the whole
+        session so the rebuilt prefix is stable across resets."""
+        return {
+            "role": "user",
+            "content": render(
+                self.templates["reset_pointer"],
+                transcript=str(self.session_dir / "transcript.md"),
+                session_dir=str(self.session_dir),
+            ),
+        }
+
     def _run_tool_calls(self, step_idx, thought, tool_calls):
         """Run every call in order, appending one tool message per call.
 
         Every observation passes the control-marker gate on its complete output
-        first, then the step's cumulative entry budget: bounding decides what
-        enters history, never whether the command runs.
+        first, then the per-command cap: bounding decides what enters the
+        context, never whether the command runs. The transcript gets one stub
+        line per call naming the log file that holds the full output.
         """
         records = []
-        remaining = self.compact["step_observation_budget_chars"]
+        cap = self.compact["command_observation_chars"]
         for index, tool_call in enumerate(tool_calls, start=1):
             step_thought = thought if index == 1 else ""
             command, error = tool_call_command(tool_call)
             if error is not None:
-                # An invalid call never ran, so it has no command log; when its
-                # text will not fit the budget whole, save it as the full text
-                # the budget note names.
-                log_path = None
-                if len(error) > remaining:
-                    log_path = self._save_full_text(f"s-{step_idx}-{index}.log", error)
-                bounded, charged = bound_observation(error, remaining, log_path)
-                remaining -= charged
-                self._append_message({"role": "tool",
-                                      "tool_call_id": tool_call.get("id"),
-                                      "content": bounded})
+                bounded = truncate_observation(error, cap)
+                self._append_message(
+                    {"role": "tool", "tool_call_id": tool_call.get("id"), "content": bounded},
+                    record=Transcript.invalid_call_stub(error),
+                )
                 records.append({"thought": step_thought, "command": None,
                                 "observation": bounded, "note": "invalid tool call"})
                 continue
@@ -408,7 +403,6 @@ class Agent:
                            "id": event_id, "command": command})
 
             result = self.environment.execute(command, step_idx, index)
-            log_path = result["log_path"]
             output, note = gate_output(result["output"])
             if self.emit:
                 self.emit({"type": "observation", "step": step_idx,
@@ -418,306 +412,110 @@ class Agent:
             observation = render(
                 self.templates["observation"],
                 returncode=result["returncode"],
-                output=output or "<no output>",
+                output=truncate_observation(output, cap) if output else "<no output>",
             )
             if note:
                 observation = f"[{note}]\n{observation}"
-            bounded, charged = bound_observation(observation, remaining, log_path)
-            remaining -= charged
-            if tool_call.get("id") is not None:
-                self._observation_logs[tool_call["id"]] = log_path
-            self._append_message({"role": "tool",
-                                  "tool_call_id": tool_call.get("id"),
-                                  "content": bounded})
+            self._append_message(
+                {"role": "tool", "tool_call_id": tool_call.get("id"), "content": observation},
+                record=Transcript.tool_stub(result["returncode"], result["output"],
+                                            result["log_path"]),
+            )
             records.append({"thought": step_thought, "command": command,
-                            "observation": bounded,
+                            "observation": observation,
                             "returncode": result["returncode"], "note": note})
         return records
-
-    def _save_full_text(self, filename, text):
-        """Write one text into the run's session log directory; return its path.
-
-        This is how the texts the compaction ladder lifts out of history - a
-        dropped reasoning block, an elided command body, an observation the
-        entry budget could not record - stay readable at the path a placeholder
-        names. Nothing is ever deleted.
-        """
-        path = Path(self.environment.log_dir) / filename
-        path.write_text(text, encoding="utf-8")
-        return str(path)
-
-    def _save_reasoning(self, text, span_ordinal):
-        return self._save_full_text(f"s-{span_ordinal}.reasoning.txt", text)
-
-    def _save_command(self, text, span_ordinal, call_index):
-        return self._save_full_text(
-            f"s-{span_ordinal}-{call_index}.command.txt", text
-        )
 
     def _threshold_tokens(self):
         return int(self.compact["threshold_fraction"] * self.compact["context_window"])
 
-    def _floor_parts(self):
-        """(system, task, tail) token estimates, the floor's three parts.
-
-        The floor is the incompressible part of the history: the system prompt
-        and task the summarize level preserves, plus the verbatim tail the
-        ladder's first three levels keep. Compaction can never push the
-        estimate below it.
-        """
-        image_tokens = self.compact["image_tokens"]
-        return (
-            est_messages_tokens(self.messages[:1], image_tokens),
-            est_messages_tokens(self.messages[1:2], image_tokens),
-            self.compact["keep_tail_tokens"],
-        )
-
-    def _floor_tokens(self):
-        return sum(self._floor_parts())
-
-    def _target_tokens(self):
-        """The line compaction stops on: the configured fraction of the window,
-        but never below the floor - the floor cannot be compacted away, so a
-        target under it would only make the ladder run to its end in vain."""
-        return max(
-            int(self.compact["target_fraction"] * self.compact["context_window"]),
-            self._floor_tokens(),
-        )
-
-    def _preflight_floor(self):
-        """Startup check on the floor, run once the initial history exists.
-
-        A floor at or above the window kills the run at startup, naming each
-        part's token count, because no compaction can ever reach the target
-        line. A floor between the threshold line and the window gets one
-        warning: compaction cannot free enough space to matter, so the session
-        will run on the over-window path instead.
-        """
-        system_tokens, task_tokens, tail_tokens = self._floor_parts()
-        floor = system_tokens + task_tokens + tail_tokens
-        window = self.compact["context_window"]
-        if floor >= window:
-            raise RuntimeError(
-                f"session floor of {floor} tokens reaches the context window of "
-                f"{window} tokens: system={system_tokens}, task={task_tokens}, "
-                f"tail={tail_tokens}; compaction can never get under the target "
-                f"line, so the session cannot run."
-            )
-        if floor >= self._threshold_tokens():
-            print(
-                f"warning: session floor of {floor} tokens is above the "
-                f"compaction threshold of {self._threshold_tokens()} tokens "
-                f"(system={system_tokens}, task={task_tokens}, "
-                f"tail={tail_tokens}); compaction cannot buy enough space, so "
-                f"the history will grow until the endpoint reports over-window.",
-                file=sys.stderr,
-            )
-
-    def _anchored_estimate(self):
-        """prompt_tokens measured by the last call plus chars/4 of what was
-        appended since. The measured value is the anchor; the chars/4 part only
-        spans messages the measurement does not know about. None without anchor."""
+    def _estimate(self):
+        """Tokens the next call would send: the last measured prompt_tokens plus
+        chars/4 of what was appended since, or chars/4 of the whole context when
+        no measurement anchors it (the first call of a run, or after a reset)."""
         measured = self.model.last_prompt_tokens
         if measured is None or self._last_query_index is None:
-            return None
-        return measured + est_messages_tokens(
-            self.messages[self._last_query_index:], self.compact["image_tokens"]
-        )
+            return est_messages_tokens(self.messages)
+        return measured + est_messages_tokens(self.messages[self._last_query_index:])
 
-    def _query_step(self, step_idx):
-        """One model call with the over-window fallback.
+    def _check_reset_floor(self):
+        """Startup check: the rebuilt context alone must sit under the threshold.
 
-        An over-window error runs one compaction and the call is retried once; a
-        second over-window failure raises. Any other error propagates unchanged.
+        A session whose system message, pointer and task already reach the
+        threshold would reset before every call and keep no memory between
+        steps, so it refuses to start, naming the three parts.
         """
-        self._last_query_index = len(self.messages)
-        try:
-            return self.model.query(self.messages, tools=[BASH_TOOL])
-        except ContextWindowExceededError:
-            self._compact(step_idx, trigger="overflow")
-        self._last_query_index = len(self.messages)
-        try:
-            return self.model.query(self.messages, tools=[BASH_TOOL])
-        except ContextWindowExceededError as exc:
+        parts = (
+            est_messages_tokens(self.messages[:1]),
+            est_messages_tokens([self._pointer_message()]),
+            est_messages_tokens([self._task]),
+        )
+        floor = sum(parts)
+        threshold = self._threshold_tokens()
+        if floor >= threshold:
             raise RuntimeError(
-                f"Step {step_idx}: context window still exceeded after one "
-                f"compaction and retry; giving up."
-            ) from exc
-
-    def _maybe_compact(self, step_idx):
-        """Threshold trigger, checked at step boundaries.
-
-        Two conditions must hold: the anchored estimate reaches the threshold
-        line, and it exceeds the target line by at least min_gain_tokens. The
-        second condition keeps a session whose floor is already high from
-        paying a full re-prefill every step: compaction would buy less than the
-        rewrite costs, so the history keeps growing and the over-window path
-        handles the real ceiling.
-        """
-        estimate = self._anchored_estimate()
-        if estimate is None or estimate < self._threshold_tokens():
-            return
-        if estimate < self._target_tokens() + self.compact["min_gain_tokens"]:
-            return
-        self._compact(step_idx, trigger="threshold", pre_tokens=estimate)
-
-    def _compact(self, step_idx, trigger, pre_tokens=None):
-        """One compaction pass over the configured ladder, then persist and emit.
-
-        The first three levels (mask, reasoning, command) rewrite history in
-        place outside the one verbatim tail all four levels share; the
-        summarize level rebuilds the history as [system, task, summary, tail].
-        The ladder stops as soon as the estimate is at or below the target
-        line. An over-window endpoint error goes straight to the summarize
-        level: the endpoint refused the call, so there is no trustworthy
-        measured anchor for the first three levels' arithmetic at that moment.
-
-        After each of the first three levels the estimate is anchored on the
-        last measured prompt_tokens minus only the characters the pass freed
-        (chars/4); a fresh whole-history estimate could hide an overfull
-        prompt. After the summarize level the rebuilt history is estimated
-        directly. Compaction rewrites self.messages in place; the state
-        protocol is untouched.
-        """
-        image_tokens = self.compact["image_tokens"]
-        ladder = list(self.compact["ladder"])
-        target_tokens = self._target_tokens()
-        floor_tokens = self._floor_tokens()
-        if pre_tokens is None:
-            estimate = self._anchored_estimate()
-            pre_tokens = (estimate if estimate is not None
-                          else est_messages_tokens(self.messages, image_tokens))
-        anchor = self.model.last_prompt_tokens
-        if trigger == "overflow" and "summarize" in ladder:
-            ladder = ladder[ladder.index("summarize"):]
-        tail_start, _ = verbatim_tail_span(
-            self.messages, self.compact["keep_tail_tokens"]
-        )
-        fingerprints = _rewrite_fingerprints(self.messages)
-
-        freed_chars = 0
-        layers_run = []
-        for level in ladder:
-            if level == "summarize":
-                self._summarize_layer(step_idx)
-                layers_run.append(level)
-                post_tokens_est = est_messages_tokens(self.messages, image_tokens)
-                break
-            if level == "mask":
-                freed = mask_old_observations(
-                    self.messages, tail_start, self._observation_logs
-                )
-            elif level == "reasoning":
-                freed = drop_old_reasoning(
-                    self.messages, tail_start, save=self._save_reasoning
-                )
-            elif level == "command":
-                freed = elide_old_commands(
-                    self.messages, tail_start,
-                    self.compact["command_head_chars"], save=self._save_command,
-                )
-            else:
-                raise RuntimeError(f"unknown compaction ladder level {level!r}")
-            layers_run.append(level)
-            freed_chars += freed
-            post_tokens_est = max(
-                0, int((anchor if anchor is not None else pre_tokens)
-                       - freed_chars // 4)
+                f"the rebuilt context alone is {floor} tokens (system={parts[0]}, "
+                f"pointer={parts[1]}, task={parts[2]}), at or above the reset "
+                f"threshold of {threshold} tokens: the session would reset at "
+                f"every step, so it cannot run."
             )
-            if post_tokens_est <= target_tokens:
-                break
 
-        invalidated_from_index = None
-        for index in range(min(len(fingerprints), len(self.messages))):
-            if _rewrite_fingerprints(self.messages[index:index + 1])[0] != fingerprints[index]:
-                invalidated_from_index = index
-                break
+    def _maybe_reset(self, step_idx):
+        """Threshold trigger, checked before every model call (the step boundary)."""
+        estimate = self._estimate()
+        if estimate >= self._threshold_tokens():
+            self._reset_context(step_idx, trigger="threshold", pre_tokens=estimate)
 
+    def _reset_context(self, step_idx, trigger, pre_tokens):
+        """Rebuild the context as [system, pointer, task], then persist and emit.
+
+        The system message object and this turn's task message are reused as
+        they are, so their bytes do not change; the pointer is rendered the same
+        way every time. The old messages leave the context but not the disk:
+        the transcript already holds them, and this reset gets its own record
+        there. The anchor is cleared so the next query re-measures.
+        """
+        self.messages = [self.messages[0], self._pointer_message(), self._task]
         self._persist_messages()
+        post_tokens_est = est_messages_tokens(self.messages)
+        self._record(Transcript.reset_record(trigger, int(pre_tokens), post_tokens_est))
         self._last_query_index = None
-        steps_since_last_compact = step_idx - self._last_compact_step
-        self._last_compact_step = step_idx
         event = {
             "type": "compact",
             "step": step_idx,
-            "layers": layers_run,
-            "layer": layers_run[-1],
             "trigger": trigger,
             "pre_tokens": int(pre_tokens),
             "post_tokens_est": post_tokens_est,
-            "target_tokens": target_tokens,
-            "floor_tokens": floor_tokens,
-            "steps_since_last_compact": steps_since_last_compact,
-            "invalidated_from_index": invalidated_from_index,
         }
         if self.emit:
             self.emit(event)
         else:
             print(
-                f"[compact] step {step_idx} layers={','.join(layers_run)} "
-                f"trigger={trigger} pre_tokens={event['pre_tokens']} "
-                f"post_tokens_est={event['post_tokens_est']} "
-                f"target_tokens={event['target_tokens']}",
+                f"[compact] step {step_idx} trigger={trigger} "
+                f"pre_tokens={event['pre_tokens']} post_tokens_est={post_tokens_est}",
                 file=sys.stderr,
             )
 
-    def _summarize_layer(self, step_idx):
-        """Rebuild history as [system, task, summary, verbatim tail]."""
-        summary = self._summary_text(step_idx)
-        tail_start, tail_end = verbatim_tail_span(
-            self.messages, self.compact["tail_budget_tokens"]
-        )
-        prefix = self.templates["compact_summary_prefix"].rstrip("\n") + "\n\n"
-        self.messages = (
-            self.messages[:2]
-            + [{"role": "user", "content": prefix + summary}]
-            + self.messages[tail_start:tail_end]
-        )
+    def _query_step(self, step_idx):
+        """One model call with the over-window fallback.
 
-    def _summary_text(self, step_idx):
-        """One same-model, tool-less summary call over the masked full history.
-
-        Summary output passes the control-marker gate: markers mean one retry,
-        then refusal. An over-window summary call drops the oldest half of the
-        maskable middle and retries once.
+        An over-window error runs one reset and the call is retried once; a
+        second over-window failure raises. Any other error propagates unchanged.
         """
-        dropped = False
-        marked = False
-        while True:
-            prompt = self.messages + [
-                {"role": "user", "content": self.templates["compact_prompt"]}
-            ]
-            try:
-                message, finish_reason = self.model.query(prompt, tools=None)
-            except ContextWindowExceededError:
-                if dropped:
-                    raise RuntimeError(
-                        f"Step {step_idx}: compaction summary still exceeds the "
-                        f"context window after dropping the oldest half of the "
-                        f"maskable middle."
-                    )
-                tail_start, _ = verbatim_tail_span(
-                    self.messages, self.compact["tail_budget_tokens"]
-                )
-                drop_oldest_middle_half(self.messages, tail_start)
-                dropped = True
-                continue
-            if finish_reason == "length":
-                raise RuntimeError(
-                    f"Step {step_idx}: compaction summary was truncated "
-                    f"(finish_reason=length); raise the endpoint's output budget."
-                )
-            text = strip_leaked_reasoning(message.get("content") or "").strip()
-            if find_control_markers(text):
-                if marked:
-                    raise RuntimeError(
-                        f"Step {step_idx}: compaction summary contains model "
-                        f"control markers after a retry; refusing to rebuild "
-                        f"history on top of it."
-                    )
-                marked = True
-                continue
-            return text
+        pre_tokens = self._estimate()
+        self._last_query_index = len(self.messages)
+        try:
+            return self.model.query(self.messages, tools=[BASH_TOOL])
+        except ContextWindowExceededError:
+            self._reset_context(step_idx, trigger="overflow", pre_tokens=pre_tokens)
+        self._last_query_index = len(self.messages)
+        try:
+            return self.model.query(self.messages, tools=[BASH_TOOL])
+        except ContextWindowExceededError as exc:
+            raise RuntimeError(
+                f"Step {step_idx}: context window still exceeded after a reset "
+                f"and retry; giving up."
+            ) from exc
 
     def _task_message(self, task):
         """The task user message: plain text, or text plus image parts.
@@ -727,9 +525,8 @@ class Agent:
         order, each a base64 data URL. Each file is read here, at message-build
         time; the CLI already validated existence, readability, suffix, and
         size before the Agent existed. Without images the message stays
-        exactly the string-content form. Either way it persists verbatim:
-        compaction retires it like any other message, resume replays it
-        as-is.
+        exactly the string-content form. Either way it persists verbatim: a
+        reset carries it over as it is, resume replays it as-is.
         """
         text = render(self.templates["instance"], task=task)
         if not self.images:
@@ -747,12 +544,13 @@ class Agent:
 
     def run(self, task):
         self.messages = self._initial_messages()
-        self._append_message(self._task_message(task))
-        self._preflight_floor()
+        self._task = self._task_message(task)
+        self._append_message(self._task, record=Transcript.user_record(self._task))
+        self._check_reset_floor()
         steps = []
         try:
             for step_idx in range(1, self.step_limit + 1):
-                self._maybe_compact(step_idx)
+                self._maybe_reset(step_idx)
                 message, finish_reason = self._query_step(step_idx)
                 if self.emit:
                     self.emit({
@@ -764,7 +562,9 @@ class Agent:
                         "compact_threshold": self._threshold_tokens(),
                         "model": self.model.model_name,
                     })
-                self._append_message(message)
+                self._append_message(
+                    message, record=Transcript.assistant_record(message, step_idx)
+                )
                 reply = strip_leaked_reasoning(message.get("content") or "").strip()
                 thought, completed = split_completion(reply, self.completion_sentinel)
                 if self.emit and thought:
@@ -800,7 +600,8 @@ class Agent:
                     )
                 observation = render(self.templates["unfinished_reply_reminder"],
                                      completion_sentinel=self.completion_sentinel)
-                self._append_message({"role": "user", "content": observation})
+                reminder = {"role": "user", "content": observation}
+                self._append_message(reminder, record=Transcript.user_record(reminder))
                 steps.append({"thought": thought, "command": None,
                               "observation": observation, "note": "unfinished reply"})
 

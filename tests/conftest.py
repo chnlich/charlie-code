@@ -84,7 +84,7 @@ class ScriptedModel:
         self._replies = iter(replies)
         self.model_name = "openai/fake-model"
         self.seen_tools = []
-        # Zero tokens: the compaction trigger never fires in these tests.
+        # Zero tokens: the reset trigger never fires in these tests.
         self.last_prompt_tokens = 0
         self.last_cached_tokens = 0
 
