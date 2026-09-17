@@ -103,6 +103,8 @@ templates:
     with `&&` in a single call when they must share state, and prefer absolute
     paths. Your working directory is: {{cwd}}
 
+    Use `rg` rather than `grep` to search in fs.
+
     Long-running commands: a command runs in the foreground and returns when it exits; the tool waits for it and
     reports progress to CharlieBot while it runs. A command still running after {{kill_after_minutes}} minutes is
     terminated, and you get its output so far with a note saying so. Run a command in the foreground when you
