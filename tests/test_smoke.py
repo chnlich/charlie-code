@@ -1,21 +1,22 @@
 """Smoke test for the agent loop end to end, with the model MOCKED.
 
-Covers one full shape of a run: an empty reply that must not end the session, a real
-bash call, and a final text answer that does.
+Covers one full shape of a run: two real bash calls, then a final text answer
+that ends the session.
 """
 
 from agent import Agent, load_config
-from conftest import ScriptedModel, assistant, final_answer, tool_call
+from conftest import ScriptedModel, assistant, tool_call
 from environment import Environment
 
 
 def test_loop_runs_tools_and_completes_on_a_text_reply(tmp_path):
     agent = Agent(
         model=ScriptedModel(
-            assistant(""),  # nothing said and nothing called: keeps going
             assistant("Creating the file.",
                       tool_calls=[tool_call(1, command="echo hi > out.txt")]),
-            final_answer("Created out.txt with the text hi."),
+            assistant("Checking it.",
+                      tool_calls=[tool_call(1, command="cat out.txt")]),
+            assistant("Created out.txt with the text hi."),
         ),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
@@ -30,14 +31,15 @@ def test_loop_runs_tools_and_completes_on_a_text_reply(tmp_path):
     assert result["final_output"] == "Created out.txt with the text hi."
     assert (tmp_path / "out.txt").read_text() == "hi\n"
 
-    assert result["steps"][0]["note"] == "unfinished reply"
-    assert result["steps"][1]["command"] == "echo hi > out.txt"
+    assert result["steps"][0]["command"] == "echo hi > out.txt"
+    assert result["steps"][0]["returncode"] == 0
+    assert result["steps"][1]["command"] == "cat out.txt"
     assert result["steps"][1]["returncode"] == 0
 
     roles = [message["role"] for message in agent.messages]
     assert roles == [
         "system", "user",        # prompt
-        "assistant", "user",     # empty reply, then the reminder
-        "assistant", "tool",     # the bash call and its result
+        "assistant", "tool",     # the first bash call and its result
+        "assistant", "tool",     # the second bash call and its result
         "assistant",             # the final answer
     ]

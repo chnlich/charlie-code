@@ -24,7 +24,7 @@ from typer.testing import CliRunner
 import main as cli_main
 import model
 from agent import Agent, load_config, tool_call_command
-from conftest import ScriptedModel, assistant, final_answer, tool_call
+from conftest import ScriptedModel, assistant, tool_call
 from environment import Environment
 from model import Model, as_message_dict
 
@@ -340,7 +340,7 @@ def test_a_slow_but_productive_run_finishes(tmp_path, templates):
     replies = [
         assistant(tool_calls=[tool_call(1, command="echo one")]),
         assistant(tool_calls=[tool_call(2, command="echo two")]),
-        final_answer("done"),
+        assistant("done"),
     ]
     agent = Agent(
         model=SleepingModel(replies, 0.2),
@@ -391,7 +391,7 @@ def test_cli_stream_and_timeout_defaults_and_overrides_reach_the_model(tmp_path,
 
     monkeypatch.setattr(Model, "__init__", init)
     monkeypatch.setattr(Model, "query",
-                        lambda self, messages, tools=None: final_answer("done"))
+                        lambda self, messages, tools=None: assistant("done"))
     monkeypatch.setattr(
         Model, "usage",
         lambda self: {"n_calls": 1, "input_tokens": 2, "output_tokens": 3},

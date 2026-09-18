@@ -19,15 +19,6 @@ model:
 
 agent:
   step_limit: 1000
-  # The last line of a final answer; removed before the answer is delivered.
-  # A tool-less reply whose last line is not this one, or that carries this
-  # line with no answer above it, is unfinished: the model is reminded and the
-  # run continues.
-  completion_sentinel: "[[END OF FINAL ANSWER]]"
-  # Consecutive tool-less replies without a complete final answer before the
-  # run fails, so a model that never learns the line costs three reminders
-  # rather than the whole step limit. Any reply carrying a tool call resets it.
-  unfinished_reply_limit: 3
 
 # Context reset. Every command's output is bounded on its own before it enters
 # the context (command_observation_chars: head and tail halves around a one-line
@@ -91,14 +82,18 @@ templates:
 
     {{skills}}
 
-    Completing the task:
-    - When the task is fully solved, reply with your final answer as plain text, no
-      tool call, and make its last line exactly:
-      {{completion_sentinel}}
-      That line is what ends the session; it is removed from the delivered answer.
-    - A reply with no tool call whose last line is not that line keeps the session
-      open: you are asked to continue, and a finished answer is sent again in full
-      with the line at its end.
+    Ending your turn:
+    - A reply with no tool call ends the session and is delivered to the user as
+      your answer, whether it solves the task, asks the user a question, or waits
+      for a later event (a wake-up, a job, a reply). To keep working, call the
+      `bash` tool.
+
+    Model control markers:
+    - The role and tool-call markers of your own chat template are special tokens
+      for your endpoint, and a reply that spells one out ends at that point. Refer
+      to them by name (the user role marker, the tool_call opening tag), and read
+      code that carries them through a transform such as a sed substitution, so the
+      marker itself never enters your reply.
 
   instance: |
     Please complete the following task:
@@ -109,12 +104,6 @@ templates:
     Exit code: {{returncode}}
     Output:
     {{output}}
-
-  unfinished_reply_reminder: |
-    Your last reply carried no tool call and did not end with the line
-    {{completion_sentinel}}
-    Either call the `bash` tool with the next command, or send the complete final
-    answer again, ending with that line.
 
   # The one user message a rebuilt context carries besides the task. Rendered
   # once per session from the transcript's absolute path and the session's .d

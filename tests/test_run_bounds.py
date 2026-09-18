@@ -14,7 +14,7 @@ import typer
 from typer.testing import CliRunner
 
 import main as cli_main
-from conftest import assistant, final_answer, tool_call
+from conftest import assistant, tool_call
 from environment import Environment
 from model import Model
 
@@ -56,7 +56,7 @@ def test_session_log_dir_is_kept_after_a_successful_run(tmp_path, monkeypatch, t
     created = _spy_environments(monkeypatch)
 
     def query(self, messages, tools=None):
-        return final_answer("Nothing to do.")
+        return assistant("Nothing to do.")
 
     monkeypatch.setattr(Model, "query", query)
 

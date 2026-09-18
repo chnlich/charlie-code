@@ -39,14 +39,6 @@ def assistant(content="", tool_calls=None, finish_reason=_UNSET, **extra):
     return message, finish_reason
 
 
-def final_answer(content, **extra):
-    """A reply that completes the run: an answer closed by the completion line."""
-    from agent import load_config
-
-    sentinel = load_config()["agent"]["completion_sentinel"]
-    return assistant(f"{content}\n{sentinel}", **extra)
-
-
 def service_unavailable():
     """A litellm explicit-HTTP-503: the only exception the request layer retries.
 

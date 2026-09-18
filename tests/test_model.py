@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 
 import main as cli_main
 import model
-from conftest import final_answer, service_unavailable
+from conftest import assistant, service_unavailable
 from model import Model, strip_leaked_reasoning
 
 
@@ -435,7 +435,7 @@ def _invoke_cli(tmp_path, monkeypatch, task_path, argv=()):
 
     monkeypatch.setattr(Model, "__init__", init)
     monkeypatch.setattr(Model, "query",
-                        lambda self, messages, tools=None: final_answer("done"))
+                        lambda self, messages, tools=None: assistant("done"))
     monkeypatch.setattr(
         Model, "usage",
         lambda self: {"n_calls": 1, "input_tokens": 2, "output_tokens": 3},

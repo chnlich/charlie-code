@@ -9,7 +9,7 @@ from litellm.exceptions import ContextWindowExceededError
 
 import transcript as transcript_module
 from agent import STATE_PROTOCOL, Agent, load_config, render
-from conftest import assistant, final_answer, tool_call
+from conftest import assistant, tool_call
 from environment import Environment
 from transcript import PREAMBLE, Transcript
 
@@ -115,7 +115,7 @@ def test_agent_records_each_message_as_it_enters_the_context(tmp_path):
     state_file = _state_file(tmp_path)
     model = _Model(
         assistant("Checking.", tool_calls=[tool_call(1, command="printf 'hello\\nworld\\n'")]),
-        final_answer("Done.", reasoning_content="deep thought"),
+        assistant("Done.", reasoning_content="deep thought"),
     )
 
     _agent(tmp_path, model, state_file).run("say hi")
@@ -136,22 +136,9 @@ def test_agent_records_each_message_as_it_enters_the_context(tmp_path):
     assert _pointer(state_file) not in text
 
 
-def test_reminders_are_recorded_as_user_records(tmp_path):
-    state_file = _state_file(tmp_path)
-    model = _Model(assistant("not finished yet", finish_reason="stop"), final_answer("done"))
-
-    _agent(tmp_path, model, state_file).run("finish")
-
-    text = _transcript_text(state_file)
-    assert text.count("\n## user · ") == 2
-    reminder = render(load_config()["templates"]["unfinished_reply_reminder"],
-                      completion_sentinel=load_config()["agent"]["completion_sentinel"])
-    assert reminder.rstrip("\n") + "\n" in text
-
-
 def test_a_reset_adds_a_reset_record_and_keeps_the_pointer_out(tmp_path):
     state_file = _state_file(tmp_path)
-    model = _Model(OVERFLOW, final_answer("done"))
+    model = _Model(OVERFLOW, assistant("done"))
 
     _agent(tmp_path, model, state_file).run("finish")
 
@@ -166,10 +153,10 @@ def test_a_reset_adds_a_reset_record_and_keeps_the_pointer_out(tmp_path):
 
 def test_a_resume_appends_to_the_same_transcript(tmp_path):
     state_file = _state_file(tmp_path)
-    _agent(tmp_path, _Model(final_answer("first")), state_file).run("turn one")
+    _agent(tmp_path, _Model(assistant("first")), state_file).run("turn one")
     first = _transcript_text(state_file)
 
-    _agent(tmp_path, _Model(final_answer("second")), state_file, resume=True).run("turn two")
+    _agent(tmp_path, _Model(assistant("second")), state_file, resume=True).run("turn two")
 
     second = _transcript_text(state_file)
     assert second.startswith(first)
@@ -187,7 +174,7 @@ def test_the_transcript_record_lands_before_the_state_file_is_rewritten(tmp_path
     monkeypatch.setattr(Agent, "_persist_messages",
                         lambda self: (order.append("persist"), real_persist(self)))
     state_file = _state_file(tmp_path)
-    model = _Model(assistant(tool_calls=[tool_call(1, command="true")]), final_answer("done"))
+    model = _Model(assistant(tool_calls=[tool_call(1, command="true")]), assistant("done"))
 
     _agent(tmp_path, model, state_file).run("finish")
 
@@ -206,7 +193,7 @@ def test_a_resume_records_an_interrupted_stub_for_each_unanswered_call(tmp_path)
     ]
     state_file.write_text(json.dumps({"protocol": STATE_PROTOCOL, "messages": history}))
 
-    _agent(tmp_path, _Model(final_answer("done")), state_file, resume=True).run("continue")
+    _agent(tmp_path, _Model(assistant("done")), state_file, resume=True).run("continue")
 
     text = _transcript_text(state_file)
     assert text.count("-> interrupted\n") == 1
@@ -214,7 +201,7 @@ def test_a_resume_records_an_interrupted_stub_for_each_unanswered_call(tmp_path)
 
 
 def test_a_session_without_a_state_file_keeps_no_transcript(tmp_path):
-    agent = _agent(tmp_path, _Model(OVERFLOW, final_answer("done")), state_file=None)
+    agent = _agent(tmp_path, _Model(OVERFLOW, assistant("done")), state_file=None)
 
     result = agent.run("finish")
 

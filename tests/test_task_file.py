@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 import main as cli_main
 from agent import load_config, render
-from conftest import assistant, final_answer
+from conftest import assistant
 from model import Model
 
 #: A single argv element cannot carry more than 128 KiB (MAX_ARG_STRLEN), so a
@@ -31,7 +31,7 @@ def _capture_model(monkeypatch):
 
     def query(self, messages, tools=None):
         seen.append([dict(message) for message in messages])
-        return final_answer("task acknowledged")
+        return assistant("task acknowledged")
 
     monkeypatch.setattr(Model, "query", query)
     monkeypatch.setattr(

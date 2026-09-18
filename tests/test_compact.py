@@ -14,7 +14,7 @@ import main as cli_main
 from agent import STATE_PROTOCOL, Agent, _load_state, load_config, render
 from compact import (IMAGE_TOKENS, TRUNCATION_MARKER, est_message_chars,
                      est_messages_tokens, truncate_observation)
-from conftest import assistant, final_answer, tool_call
+from conftest import assistant, tool_call
 from environment import Environment
 from model import Model
 
@@ -119,7 +119,7 @@ def test_each_command_is_bounded_on_its_own_with_the_header_intact(tmp_path):
         (assistant(tool_calls=[tool_call(1, command=_big_output(300, "x")),
                                tool_call(2, command=_big_output(300, "y")),
                                tool_call(3, command=_big_output(100, "z"))]), 100),
-        (final_answer("done"), 100),
+        (assistant("done"), 100),
     )
     agent = _agent(tmp_path, model, compact=_compact(command_observation_chars=100))
 
@@ -138,7 +138,7 @@ def test_each_command_is_bounded_on_its_own_with_the_header_intact(tmp_path):
 def test_invalid_tool_call_error_is_bounded_by_the_same_cap(tmp_path):
     model = ResetModel(
         (assistant(tool_calls=[tool_call(1, name="nope", command="ls")]), 100),
-        (final_answer("done"), 100),
+        (assistant("done"), 100),
     )
     agent = _agent(tmp_path, model, compact=_compact(command_observation_chars=40))
 
@@ -157,7 +157,7 @@ def test_threshold_trigger_uses_the_measured_anchor_plus_what_was_appended(
     tmp_path, measured, resets
 ):
     s1 = assistant(tool_calls=[tool_call(1, command=_big_output(2000))])
-    model = ResetModel((s1, measured), (final_answer("done"), 100))
+    model = ResetModel((s1, measured), (assistant("done"), 100))
     events = []
     state_file = tmp_path / "sessions" / "abc.json"
     state_file.parent.mkdir()
@@ -199,7 +199,7 @@ def test_without_an_anchor_the_whole_context_is_estimated_and_a_resume_can_reset
         {"role": "assistant", "content": "earlier answer"},
     ]
     state_file.write_text(json.dumps({"protocol": STATE_PROTOCOL, "messages": history}))
-    model = ResetModel((final_answer("done"), 100))
+    model = ResetModel((assistant("done"), 100))
     events = []
     agent = _agent(tmp_path, model, emit=events.append, state_file=state_file, resume=True)
 
@@ -231,7 +231,7 @@ def test_est_message_chars_counts_text_reasoning_calls_and_images():
 
 def test_last_query_index_is_cleared_by_a_reset_and_reanchored_by_the_next_query(tmp_path):
     seen = []
-    model = ResetModel((OVERFLOW, None), (final_answer("done"), 100))
+    model = ResetModel((OVERFLOW, None), (assistant("done"), 100))
     agent = _agent(tmp_path, model, emit=lambda e: seen.append(agent._last_query_index)
                    if e["type"] == "compact" else None)
 
@@ -248,7 +248,7 @@ def test_system_and_task_messages_are_reused_as_they_are_across_resets(tmp_path)
     image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
     s1 = assistant(tool_calls=[tool_call(1, command="echo hi")])
     model = ResetModel((OVERFLOW, None), (s1, 100), (OVERFLOW, None),
-                       (final_answer("done"), 100))
+                       (assistant("done"), 100))
     agent = _agent(tmp_path, model, images=[str(image)])
 
     agent.run("look at the picture")
@@ -267,7 +267,7 @@ def test_state_file_after_a_reset_holds_the_three_messages_and_resumes_from_them
     state_file = tmp_path / "sessions" / "abc.json"
     state_file.parent.mkdir()
     snapshots = []
-    model = ResetModel((OVERFLOW, None), (final_answer("first answer"), 100))
+    model = ResetModel((OVERFLOW, None), (assistant("first answer"), 100))
     agent = _agent(tmp_path, model, state_file=state_file,
                    emit=lambda e: snapshots.append(_load_state(state_file))
                    if e["type"] == "compact" else None)
@@ -277,7 +277,7 @@ def test_state_file_after_a_reset_holds_the_three_messages_and_resumes_from_them
     assert [m["role"] for m in snapshot] == ["system", "user", "user"]
     assert snapshot[1]["content"] == _pointer(tmp_path / "sessions" / "abc.d")
 
-    second = ResetModel((final_answer("second answer"), 100))
+    second = ResetModel((assistant("second answer"), 100))
     _agent(tmp_path, second, state_file=state_file, resume=True).run("second task")
     (prompt,) = second.seen_prompts
     assert prompt[:3] == snapshot
@@ -302,12 +302,12 @@ def test_old_session_state_loads_unchanged_and_the_first_reset_clears_its_placeh
     state_file.parent.mkdir()
     state_file.write_text(json.dumps({"protocol": STATE_PROTOCOL, "messages": history}))
 
-    roomy = ResetModel((final_answer("done"), 100))
+    roomy = ResetModel((assistant("done"), 100))
     _agent(tmp_path, roomy, state_file=state_file, resume=True).run("continue")
     (prompt,) = roomy.seen_prompts
     assert prompt[:len(history)] == history  # loaded as-is, placeholders and all
 
-    tight = ResetModel((final_answer("done again"), 100))
+    tight = ResetModel((assistant("done again"), 100))
     _agent(tmp_path, tight, state_file=state_file, resume=True,
            compact=_compact(context_window=1000)).run("continue once more")
     (prompt,) = tight.seen_prompts
@@ -320,7 +320,7 @@ def test_old_session_state_loads_unchanged_and_the_first_reset_clears_its_placeh
 def test_overflow_resets_and_retries_once_and_the_compact_event_precedes_the_context_event(
     tmp_path,
 ):
-    model = ResetModel((OVERFLOW, None), (final_answer("finished after retry"), 900))
+    model = ResetModel((OVERFLOW, None), (assistant("finished after retry"), 900))
     events = []
     agent = _agent(tmp_path, model, emit=events.append)
 
@@ -360,7 +360,7 @@ def test_an_unrelated_400_propagates_unchanged_without_a_reset(tmp_path):
 # --- the startup floor --------------------------------------------------------
 
 def test_a_rebuilt_context_that_reaches_the_threshold_refuses_to_start(tmp_path):
-    model = ResetModel((final_answer("never reached"), 100))
+    model = ResetModel((assistant("never reached"), 100))
     agent = _agent(tmp_path, model, compact=_compact(context_window=100))
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -377,12 +377,12 @@ def test_compact_event_has_five_keys_and_without_emit_becomes_one_stderr_line(
     tmp_path, capsys
 ):
     events = []
-    _agent(tmp_path, ResetModel((OVERFLOW, None), (final_answer("done"), 100)),
+    _agent(tmp_path, ResetModel((OVERFLOW, None), (assistant("done"), 100)),
            emit=events.append).run("finish")
     (event,) = [e for e in events if e["type"] == "compact"]
     assert set(event) == {"type", "step", "trigger", "pre_tokens", "post_tokens_est"}
 
-    _agent(tmp_path, ResetModel((OVERFLOW, None), (final_answer("done"), 100))).run("finish")
+    _agent(tmp_path, ResetModel((OVERFLOW, None), (assistant("done"), 100))).run("finish")
     err = capsys.readouterr().err
     assert err.startswith("[compact] step 1 trigger=overflow pre_tokens=")
     assert "post_tokens_est=" in err
@@ -395,8 +395,8 @@ def test_every_prompt_extends_the_previous_one_until_a_reset(tmp_path):
         (assistant("first", tool_calls=[tool_call(1, command="echo one")]), 100),
         (assistant("second", tool_calls=[tool_call(1, command="echo two"),
                                          tool_call(2, command="echo three")]), 100),
-        (assistant("third", finish_reason="stop"), 100),   # a reminder follows
-        (final_answer("done"), 100),
+        (assistant("third", tool_calls=[tool_call(1, command="echo four")]), 100),
+        (assistant("done"), 100),
     )
     agent = _agent(tmp_path, model)
 
@@ -440,11 +440,11 @@ def test_a_resumed_turn_extends_the_previous_turn_prefix_byte_for_byte(
 ):
     first_prompts, events = _run_cli(tmp_path, task_file("turn one"), monkeypatch, [
         assistant(tool_calls=[tool_call(1, command="printf one")]),
-        final_answer("Turn one complete."),
+        assistant("Turn one complete."),
     ], measured=100)
     session_id = [e for e in events if e["type"] == "session"][0]["session_id"]
     second_prompts, _ = _run_cli(tmp_path, task_file("turn two"), monkeypatch, [
-        final_answer("Turn two complete."),
+        assistant("Turn two complete."),
     ], measured=100, extra_args=["--resume", session_id])
 
     last = first_prompts[-1]
@@ -455,7 +455,7 @@ def test_a_resumed_turn_extends_the_previous_turn_prefix_byte_for_byte(
 def test_context_window_flag_scales_the_trigger(tmp_path, monkeypatch, task_file):
     responses = [
         assistant(tool_calls=[tool_call(1, command="printf one")]),
-        final_answer("done"),
+        assistant("done"),
     ]
     prompts, events = _run_cli(tmp_path, task_file("go"), monkeypatch, responses,
                                measured=12990, extra_args=["--context-window", "20000"])

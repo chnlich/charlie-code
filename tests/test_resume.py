@@ -8,8 +8,8 @@ import main as cli_main
 import model
 import pytest
 
-from agent import INTERRUPTED_TOOL_RESULT, STATE_PROTOCOL, load_config
-from conftest import (FakeCompletionResponse, assistant, final_answer,
+from agent import INTERRUPTED_TOOL_RESULT, STATE_PROTOCOL
+from conftest import (FakeCompletionResponse, assistant,
                       service_unavailable, tool_call)
 from environment import Environment
 from model import Model
@@ -28,9 +28,9 @@ def _json_lines(output):
 def test_session_resume_persists_and_reloads_messages(tmp_path, monkeypatch, task_file):
     responses = iter([
         assistant(tool_calls=[tool_call(1, command="printf 'turn-one-output\\n'")]),
-        final_answer("Turn one complete."),
+        assistant("Turn one complete."),
         assistant(tool_calls=[tool_call(1, command="printf 'turn-two-output\\n'")]),
-        final_answer("Turn two complete."),
+        assistant("Turn two complete."),
     ])
     captured_messages = []
 
@@ -153,7 +153,7 @@ def test_state_file_holds_the_turn_so_far_before_each_risky_step(
 
     responses = iter([
         assistant(tool_calls=[tool_call(1, command="printf 'one\\n'")]),
-        final_answer("Done."),
+        assistant("Done."),
     ])
 
     def query(self, messages, tools=None):
@@ -209,7 +209,7 @@ def test_resume_answers_dangling_tool_calls_before_the_new_task(
 
     def query(self, messages, tools=None):
         prompts.append([message.copy() for message in messages])
-        return final_answer("Turn two complete.")
+        return assistant("Turn two complete.")
 
     monkeypatch.setattr(Model, "query", query)
     monkeypatch.setattr(
@@ -263,8 +263,7 @@ def test_retried_model_call_persists_only_the_delivered_reply(
     delivered assistant reply exactly once, and a resumed run starts from that
     history without any phantom message from the failed attempts."""
     session_dir = tmp_path / "sessions"
-    sentinel = load_config()["agent"]["completion_sentinel"]
-    delivered = FakeCompletionResponse(f"Turn one complete.\n{sentinel}")
+    delivered = FakeCompletionResponse("Turn one complete.")
     calls = []
 
     def first_run_completion(**kwargs):
@@ -297,7 +296,7 @@ def test_retried_model_call_persists_only_the_delivered_reply(
     def resumed_completion(**kwargs):
         # Snapshot: kwargs["messages"] is the live list the run keeps appending to.
         resumed_calls.append([m.copy() for m in kwargs["messages"]])
-        return FakeCompletionResponse(f"Turn two complete.\n{sentinel}")
+        return FakeCompletionResponse("Turn two complete.")
 
     monkeypatch.setattr(litellm, "completion", resumed_completion)
 

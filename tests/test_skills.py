@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 import main as cli_main
 from agent import load_config, render
-from conftest import assistant, final_answer
+from conftest import assistant
 from model import Model
 from skills import find_repo_root, load_skill_catalog
 
@@ -196,7 +196,7 @@ def _capture_model(monkeypatch):
 
     def query(self, messages, tools=None):
         seen.append([dict(message) for message in messages])
-        return final_answer("task acknowledged")
+        return assistant("task acknowledged")
 
     monkeypatch.setattr(Model, "query", query)
     monkeypatch.setattr(
@@ -226,7 +226,7 @@ def _catalog_block(system_content):
     lines = system_content.splitlines()
     starts = [i for i, line in enumerate(lines) if line.startswith("# Available skills")]
     assert len(starts) == 1, system_content
-    end = next(i for i in range(starts[0], len(lines)) if lines[i].startswith("Completing the task"))
+    end = next(i for i in range(starts[0], len(lines)) if lines[i].startswith("Ending your turn"))
     return "\n".join(lines[starts[0]:end])
 
 

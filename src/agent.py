@@ -2,10 +2,9 @@
 
 The conversation is a flat message list. Each step the model answers with an
 assistant message; when it carries tool calls we run them and feed one tool message
-back per call. When it carries none, the session ends only if the model said so:
-the reply's last line is the completion sentinel and an answer stands above it.
-Shape alone never proves completion, because a truncated reply looks exactly like
-a finished one; a sentinel cannot be truncated into existence.
+back per call. A reply that carries no tool call ends the session and is
+delivered to the user as the answer, as written. A reply with neither tool
+calls nor text is an error.
 
 History is append-only: a message that has been sent is never rewritten, so the
 prompt prefix stays byte-identical from one call to the next and the endpoint's
@@ -95,32 +94,6 @@ def render(template, **values):
     for key, value in values.items():
         template = template.replace("{{" + key + "}}", str(value))
     return template
-
-
-def split_completion(text, sentinel):
-    """Split a final answer from its completion line: (answer, completed).
-
-    Completion is the model's own declaration: the last non-empty line is the
-    sentinel and an answer stands above it. Matching tolerates surrounding
-    whitespace and Markdown emphasis, which costs no safety, because a cut-off
-    reply can only lose characters and never gain the line. A reply that is the
-    bare sentinel carries no answer, so it reads as unfinished.
-    """
-    lines = text.rstrip().splitlines()
-    if not lines:
-        return text, False
-    last = lines[-1].strip()
-    while True:
-        undecorated = last.strip("`*").strip()
-        if undecorated == last:
-            break
-        last = undecorated
-    if last != sentinel:
-        return text, False
-    answer = "\n".join(lines[:-1]).rstrip()
-    if not answer:
-        return text, False
-    return answer, True
 
 
 def find_control_markers(text):
@@ -247,24 +220,11 @@ class Agent:
         resume=False,
         compact=None,
         images=(),
-        completion_sentinel=None,
-        unfinished_reply_limit=None,
     ):
         self.model = model
         self.environment = environment
         self.templates = templates
         self.step_limit = step_limit
-        agent_config = load_config()["agent"]
-        self.completion_sentinel = (
-            completion_sentinel if completion_sentinel is not None
-            else agent_config["completion_sentinel"]
-        )
-        self.unfinished_reply_limit = (
-            unfinished_reply_limit if unfinished_reply_limit is not None
-            else agent_config["unfinished_reply_limit"]
-        )
-        # Consecutive tool-less replies that did not complete; any tool call resets it.
-        self._unfinished_replies = 0
         self.skills_catalog = skills_catalog
         self.emit = emit
         # The executor reports command progress into the same event stream.
@@ -318,7 +278,6 @@ class Agent:
             self.templates["system"],
             cwd=self.environment.cwd,
             skills=self.skills_catalog,
-            completion_sentinel=self.completion_sentinel,
             kill_after_minutes=f"{self.environment.kill_after_seconds / 60:g}",
         )
         agents_md = read_agents_md(self.environment.cwd)
@@ -566,9 +525,8 @@ class Agent:
                     message, record=Transcript.assistant_record(message, step_idx)
                 )
                 reply = strip_leaked_reasoning(message.get("content") or "").strip()
-                thought, completed = split_completion(reply, self.completion_sentinel)
-                if self.emit and thought:
-                    self.emit({"type": "thought", "step": step_idx, "text": thought})
+                if self.emit and reply:
+                    self.emit({"type": "thought", "step": step_idx, "text": reply})
 
                 if finish_reason == "length":
                     raise RuntimeError(
@@ -578,8 +536,7 @@ class Agent:
 
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
-                    self._unfinished_replies = 0
-                    steps.extend(self._run_tool_calls(step_idx, thought, tool_calls))
+                    steps.extend(self._run_tool_calls(step_idx, reply, tool_calls))
                     continue
 
                 if finish_reason != "stop":
@@ -587,23 +544,13 @@ class Agent:
                         f"Step {step_idx}: unexpected finish_reason={finish_reason!r}."
                     )
 
-                if completed:
-                    return {"task": task, "steps": steps, "completed": True,
-                            "n_steps": step_idx, "final_output": thought,
-                            "usage": self.model.usage()}
+                if not reply:
+                    raise RuntimeError(f"Step {step_idx}: empty reply with no "
+                                       "tool call; nothing to deliver.")
 
-                self._unfinished_replies += 1
-                if self._unfinished_replies >= self.unfinished_reply_limit:
-                    raise RuntimeError(
-                        f"Step {step_idx}: {self.unfinished_reply_limit} consecutive replies "
-                        "without a tool call or the completion line; giving up."
-                    )
-                observation = render(self.templates["unfinished_reply_reminder"],
-                                     completion_sentinel=self.completion_sentinel)
-                reminder = {"role": "user", "content": observation}
-                self._append_message(reminder, record=Transcript.user_record(reminder))
-                steps.append({"thought": thought, "command": None,
-                              "observation": observation, "note": "unfinished reply"})
+                return {"task": task, "steps": steps, "completed": True,
+                        "n_steps": step_idx, "final_output": reply,
+                        "usage": self.model.usage()}
 
             raise RuntimeError(
                 f"Step limit ({self.step_limit}) exceeded without task completion."

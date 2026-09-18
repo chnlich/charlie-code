@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 import main as cli_main
 import model
 from agent import Agent, load_config
-from conftest import (FakeCompletionResponse, ScriptedModel, assistant, final_answer,
+from conftest import (FakeCompletionResponse, ScriptedModel, assistant,
                       service_unavailable, tool_call)
 from environment import Environment
 from model import Model
@@ -76,7 +76,7 @@ def test_json_happy_path_streams_events_and_result(tmp_path, monkeypatch, task_f
     _patch_model(
         monkeypatch,
         assistant("Writing file.", tool_calls=[tool_call(1, command="printf hi > out.txt")]),
-        final_answer("Wrote out.txt."),
+        assistant("Wrote out.txt."),
     )
 
     result = CliRunner().invoke(
@@ -179,10 +179,9 @@ def test_agent_emit_collects_per_step_events(tmp_path):
     events = []
     agent = Agent(
         model=ScriptedModel(
-            assistant(""),
             assistant("Writing file.",
                       tool_calls=[tool_call(1, command="printf hi > out.txt")]),
-            final_answer("Wrote out.txt."),
+            assistant("Wrote out.txt."),
         ),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
@@ -196,23 +195,22 @@ def test_agent_emit_collects_per_step_events(tmp_path):
     assert result["completed"] is True
     assert [event["type"] for event in events] == [
         "context",
-        "context",
         "thought",
         "command",
         "observation",
         "context",
         "thought",
     ]
-    assert events[2] == {"type": "thought", "step": 2, "text": "Writing file."}
-    assert events[3]["step"] == events[4]["step"] == 2
-    assert events[3]["id"] == events[4]["id"]
-    assert events[4]["returncode"] == 0
+    assert events[1] == {"type": "thought", "step": 1, "text": "Writing file."}
+    assert events[2]["step"] == events[3]["step"] == 1
+    assert events[2]["id"] == events[3]["id"]
+    assert events[3]["returncode"] == 0
     assert (tmp_path / "out.txt").read_text() == "hi"
 
 
 def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     success = Agent(
-        model=ScriptedModel(final_answer("Nothing to do.")),
+        model=ScriptedModel(assistant("Nothing to do.")),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
@@ -243,7 +241,7 @@ def test_agent_without_emit_keeps_return_and_step_limit_behavior(tmp_path):
     with_usage = Agent(
         model=UsageModel(
             (assistant("Working.", tool_calls=[tool_call(1, command="true")]), 4321),
-            (final_answer("done"), 8765),
+            (assistant("done"), 8765),
         ),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
@@ -264,7 +262,7 @@ def test_context_event_per_model_call_reports_that_calls_usage(tmp_path):
         model=UsageModel(
             (assistant("First.", tool_calls=[tool_call(1, command="echo one")]), 111),
             (assistant("Second.", tool_calls=[tool_call(2, command="echo two")]), 222),
-            (final_answer("all done"), 333),
+            (assistant("all done"), 333),
         ),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
@@ -303,7 +301,7 @@ def test_context_event_threshold_is_fraction_times_window_for_the_config_in_use(
     }
     events = []
     agent = Agent(
-        model=UsageModel((final_answer("done"), 100)),
+        model=UsageModel((assistant("done"), 100)),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
@@ -324,7 +322,7 @@ def test_cli_context_window_flag_flows_into_the_context_event(
 ):
     def query(self, messages, tools=None):
         self.last_prompt_tokens = 118234
-        return final_answer("done")
+        return assistant("done")
 
     monkeypatch.setattr(Model, "query", query)
 
@@ -357,7 +355,7 @@ def test_cli_context_window_flag_flows_into_the_context_event(
 
 def test_context_event_carries_the_cached_tokens_the_endpoint_reported(tmp_path):
     events = []
-    model = UsageModel((final_answer("done"), 60012))
+    model = UsageModel((assistant("done"), 60012))
     model.last_cached_tokens = 58880
     agent = Agent(
         model=model,
@@ -376,7 +374,7 @@ def test_context_event_carries_the_cached_tokens_the_endpoint_reported(tmp_path)
 
 
 def test_context_event_on_the_overflow_retry_reports_the_retry_usage(tmp_path):
-    s_done = final_answer("finished after retry")
+    s_done = assistant("finished after retry")
     events = []
     agent = Agent(
         model=UsageModel(
@@ -408,7 +406,7 @@ def test_context_event_without_usage_reports_null_prompt_tokens(tmp_path):
     events = []
     compact = load_config()["compact"]
     agent = Agent(
-        model=UsageModel((final_answer("done"), None)),
+        model=UsageModel((assistant("done"), None)),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                               kill_after_seconds=10, log_dir=str(tmp_path)),
         templates=load_config()["templates"],
@@ -437,8 +435,7 @@ def test_transient_503_retries_inside_one_call_and_keeps_the_json_stream_clean(
     """A 503 recovered inside Model.query is invisible to the event stream: the
     delivered reply accounts the usage, and the retry chatter - status code and
     attempt number only - stays on stderr, never in the stdout JSON events."""
-    sentinel = load_config()["agent"]["completion_sentinel"]
-    delivered = FakeCompletionResponse(f"Done.\n{sentinel}", prompt_tokens=11,
+    delivered = FakeCompletionResponse("Done.", prompt_tokens=11,
                                        completion_tokens=5)
     calls = []
 
