@@ -12,6 +12,7 @@ import os
 import signal
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -184,3 +185,99 @@ def test_command_log_is_written_to_the_given_dir_and_never_deleted(tmp_path):
                       "log_path": str(log_dir / "s-3-2.log")}
     # Session logs are never removed: the transcript stubs point at them.
     assert (log_dir / "s-3-2.log").read_text() == "hello\n"
+
+
+def test_start_background_returns_at_once_and_lists_the_running_task(tmp_path):
+    env = _env(tmp_path, cap=10)
+    try:
+        start = time.monotonic()
+        task = env.start_background("sleep 5", 1, 1)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1, "start_background must not wait on the command"
+        assert task.id == "s-1-1"
+        assert _alive(task.pid)
+        assert task.log_path.endswith("s-1-1.log")
+        assert [t.id for t in env.running_background()] == ["s-1-1"]
+        assert env.finished_pending() == 0
+    finally:
+        env.kill_running()
+
+
+def test_background_task_that_exits_is_reaped_and_handed_out_once(tmp_path):
+    env = _env(tmp_path, cap=10)
+    try:
+        task = env.start_background("echo out; exit 3", 1, 2)
+
+        deadline = time.monotonic() + 1
+        while env.finished_pending() == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert not _alive(task.pid), "the supervising thread reaps the instant it exits"
+        assert env.finished_pending() == 1
+        (finished,) = env.pop_finished()
+        assert finished is task
+        assert finished.returncode == 3
+        assert finished.killed is False
+        assert finished.duration is not None
+        assert Path(task.log_path).read_text() == "out\n"
+        assert env.pop_finished() == []
+    finally:
+        env.kill_running()
+
+
+def test_background_task_past_the_cap_is_terminated_and_recorded(tmp_path):
+    env = _env(tmp_path, cap=0.5)
+    try:
+        task = env.start_background("sleep 30", 1, 3)
+
+        finished = []
+        deadline = time.monotonic() + 3
+        while not finished and time.monotonic() < deadline:
+            finished = env.pop_finished()
+            if not finished:
+                time.sleep(0.05)
+
+        assert [t.id for t in finished] == ["s-1-3"]
+        assert finished[0].killed is True
+        assert finished[0].returncode == -signal.SIGTERM
+        assert not _alive(task.pid)
+    finally:
+        env.kill_running()
+
+
+def test_kill_running_kills_background_groups_too(tmp_path):
+    env = _env(tmp_path, cap=10)
+    try:
+        task = env.start_background("sleep 30", 1, 4)
+        env.kill_running()
+
+        deadline = time.monotonic() + 1
+        while env.finished_pending() == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert not _alive(task.pid)
+        time.sleep(0.1)
+        assert not _group_alive(task.pid)
+        assert env.running_background() == []
+        (finished,) = env.pop_finished()
+        assert finished.returncode == -signal.SIGKILL
+    finally:
+        env.kill_running()
+
+
+def test_background_shell_exit_reaps_its_backgrounded_survivor(tmp_path):
+    env = _env(tmp_path, cap=10)
+    try:
+        task = env.start_background("sleep 100 & echo $!", 1, 5)
+
+        deadline = time.monotonic() + 1
+        while env.finished_pending() == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert not _alive(task.pid)
+        pid = int(Path(task.log_path).read_text().strip())
+        time.sleep(0.3)
+        assert not _alive(pid)
+    finally:
+        env.kill_running()

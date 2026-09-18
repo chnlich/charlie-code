@@ -10,9 +10,11 @@ reports progress: at each `progress_notices_seconds` tick it emits a
 `command_progress` event (the harness renders it as a chat note), and a command
 still running at `kill_after_seconds` is terminated: SIGTERM to its process
 group, SIGKILL after a short grace period if it is still there. The observation
-then carries the output so far plus a note naming the cap. There is no
-background demotion: a command either returns on its own or is terminated, so
-nothing outlives the call except what an explicit `setsid` detaches.
+then carries the output so far plus a note naming the cap. A command may
+instead be started in the background, where a supervising thread waits on it,
+terminates it at the same cap, reaps it the instant it exits, and records the
+exit for the caller to collect. Nothing outlives the run except what an
+explicit `setsid` detaches.
 
 A command returning on its own has its process group reaped right away, which
 kills any `cmd &` survivors sharing the group. A command that escapes via an
@@ -27,9 +29,11 @@ command. The directory is created by main.py and passed in; nothing is removed a
 exit.
 """
 
+import dataclasses
 import os
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -45,6 +49,26 @@ _REAP_GRACE_SECONDS = 0.1
 # costs seconds past the cap, not minutes. Same shape as the harness's own stop
 # path, which SIGTERMs charlie-code and SIGKILLs it 5 seconds later.
 _TERM_GRACE_SECONDS = 5
+
+
+@dataclasses.dataclass
+class BackgroundTask:
+    """A background command: launch identity, plus its exit record once reaped.
+
+    `returncode` is what Popen reports (negative when a signal killed it),
+    `duration` the seconds from start to exit, and `killed` True when the cap
+    terminated the command; they stay None/False until the supervising thread
+    records the exit.
+    """
+
+    id: str
+    command: str
+    pid: int
+    log_path: str
+    started: float
+    returncode: int | None = None
+    duration: float | None = None
+    killed: bool = False
 
 
 def _signal_group(pgid, sig):
@@ -83,17 +107,21 @@ class Environment:
         self.emit = emit
         # The Popen being waited on, so a signal handler can kill it mid-wait.
         self._running = None
+        # Background tasks still running: task id -> (BackgroundTask, Popen).
+        self._background = {}
+        # Background tasks that exited, in exit order, not yet handed out.
+        self._finished = []
+        # Guards _background and _finished against the supervising threads.
+        self._lock = threading.Lock()
 
-    def execute(self, command, step, call):
-        """Run one bash command and return its combined output and exit code.
+    def _spawn(self, command, step, call):
+        """Start `command` as its own session with output to its command log.
 
-        The full output goes to <log_dir>/s-<step>-<call>.log and stays there
-        after the run, so the transcript's stub line can name it as the way to
-        read the observation back. A command still running at the cap is
-        terminated and its output gets the termination note appended.
+        Shared by `execute` and `start_background` so the two launch paths
+        cannot drift. Returns (Popen, log_path); the log file is closed here,
+        the child keeps its duplicate of the fd.
         """
         log_path = os.path.join(self.log_dir, f"s-{step}-{call}.log")
-
         with open(log_path, "wb") as logf:
             proc = subprocess.Popen(
                 command,
@@ -104,6 +132,17 @@ class Environment:
                 stdout=logf,
                 stderr=subprocess.STDOUT,
             )
+        return proc, log_path
+
+    def execute(self, command, step, call):
+        """Run one bash command and return its combined output and exit code.
+
+        The full output goes to <log_dir>/s-<step>-<call>.log and stays there
+        after the run, so the transcript's stub line can name it as the way to
+        read the observation back. A command still running at the cap is
+        terminated and its output gets the termination note appended.
+        """
+        proc, log_path = self._spawn(command, step, call)
 
         self._running = proc
         try:
@@ -127,6 +166,71 @@ class Environment:
                 f"for it as your role prompt describes.]"
             )
         return {"output": output, "returncode": proc.returncode, "log_path": log_path}
+
+    def start_background(self, command, step, call):
+        """Start `command` in the background and return its task at once.
+
+        The task is registered under its `s-<step>-<call>` id and a daemon
+        thread supervises the process: it terminates the command at the same
+        `kill_after_seconds` cap, reaps it the instant it exits, and records
+        the exit for `pop_finished` to hand out. No progress events are
+        emitted for a background task.
+        """
+        proc, log_path = self._spawn(command, step, call)
+        task = BackgroundTask(id=f"s-{step}-{call}", command=command, pid=proc.pid,
+                              log_path=log_path, started=time.monotonic())
+        with self._lock:
+            self._background[task.id] = (task, proc)
+        threading.Thread(target=self._supervise, args=(task, proc), daemon=True).start()
+        return task
+
+    def _supervise(self, task, proc):
+        """Wait on a background task, terminate it at the cap, record its exit.
+
+        Runs on the task's daemon thread: this wait is what reaps the child, so
+        its pid is gone the moment it exits. It never emits an event and only
+        touches `task`, `proc`, and the task collections under the lock.
+        """
+        killed = not _exited_before(proc, task.started + self.kill_after_seconds)
+        if killed:
+            _signal_group(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                _signal_group(proc.pid, signal.SIGKILL)
+                proc.wait()
+        else:
+            # Same grace as the foreground path: an in-flight `setsid` escape
+            # needs room to detach before the group is reaped.
+            time.sleep(_REAP_GRACE_SECONDS)
+        # Collect `cmd &` survivors sharing the group, as the foreground does.
+        _signal_group(proc.pid, signal.SIGKILL)
+        with self._lock:
+            task.returncode = proc.returncode
+            task.duration = time.monotonic() - task.started
+            task.killed = killed
+            del self._background[task.id]
+            self._finished.append(task)
+
+    def running_background(self):
+        """The background tasks still running, in start order."""
+        with self._lock:
+            return [task for task, _ in self._background.values()]
+
+    def finished_pending(self):
+        """How many exited background tasks have not been handed out yet."""
+        with self._lock:
+            return len(self._finished)
+
+    def pop_finished(self, limit=None):
+        """Remove and return the first `limit` exited tasks, in exit order.
+
+        All of them when `limit` is None.
+        """
+        with self._lock:
+            handed_out = self._finished if limit is None else self._finished[:limit]
+            self._finished = self._finished[len(handed_out):]
+            return handed_out
 
     def _wait_reporting_progress(self, proc, step, call, log_path):
         """Wait for `proc`, emitting a progress event at each notice tick.
@@ -162,11 +266,18 @@ class Environment:
     def kill_running(self):
         """SIGKILL the process group of the command being waited on, if any.
 
-        Meant for a signal handler: the interrupted wait in `execute` observes
-        the exit and returns, so no reaping happens here.
+        Background command groups are killed here too; their supervising
+        threads observe the exits and do the reaping. Meant for a signal
+        handler: the interrupted wait in `execute` observes the exit and
+        returns, so no reaping happens here. The background snapshot is taken
+        without the lock -- a handler that blocked on a lock the interrupted
+        main thread holds would deadlock, and `list(dict.values())` is atomic
+        under the GIL.
         """
         if self._running is not None:
             _signal_group(self._running.pid, signal.SIGKILL)
+        for _, proc in list(self._background.values()):
+            _signal_group(proc.pid, signal.SIGKILL)
 
 
 def _exited_before(proc, deadline):
