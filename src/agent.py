@@ -1,5 +1,10 @@
 """Core linear-history agent loop, modeled on mini-swe-agent's ~100-line core.
 
+A bash call can run its command in the background: the call returns at once
+with the task id, pid and log path while the command keeps running under the
+kill cap, and its exit record rides appended to a later tool result, at most
+four records per result. Whatever still runs when the run ends is killed.
+
 The conversation is a flat message list. Each step the model answers with an
 assistant message; when it carries tool calls we run them and feed one tool message
 back per call. A reply that carries no tool call ends the session and is
@@ -31,6 +36,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
@@ -64,15 +70,31 @@ BASH_TOOL = {
         "name": "bash",
         "description": (
             "Run one bash command in a fresh subprocess and return its combined "
-            "stdout/stderr and exit code."
+            "stdout/stderr and exit code. With background=true the call returns at "
+            "once with the task id, pid and log path while the command keeps "
+            "running; its exit code and output arrive appended to a later tool "
+            "result."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"command": {"type": "string"}},
+            "properties": {
+                "command": {"type": "string"},
+                "background": {
+                    "type": "boolean",
+                    "description": "Start the command and return at once; default false.",
+                },
+            },
             "required": ["command"],
         },
     },
 }
+
+# Exited background tasks delivered per tool result. Each record's output is
+# bounded by command_observation_chars (5000) on its own, so four records add at
+# most about 20k characters, about 5k tokens: a burst of finished tasks cannot push
+# the context estimate over the reset threshold in one step. The rest wait for the
+# next tool result, in exit order.
+BACKGROUND_DELIVERY_LIMIT = 4
 
 # Structure markers of the model families we drive. Command output carrying any of
 # these is withheld rather than fed back: the serving stack parses the model's
@@ -123,19 +145,27 @@ def gate_output(output):
 
 
 def tool_call_command(tool_call):
-    """Return (command, error); exactly one of the two is None."""
+    """Return (command, background, error); exactly one of command and error is None.
+
+    `background` is False when the argument is absent; when present it must be a
+    JSON boolean, and anything else is an error that starts nothing.
+    """
     function = tool_call.get("function") or {}
     name = function.get("name")
     if name != "bash":
-        return None, f"Error: there is no tool named {name!r}. The only tool is `bash`."
+        return (None, False,
+                f"Error: there is no tool named {name!r}. The only tool is `bash`.")
     try:
         arguments = json.loads(function.get("arguments") or "{}")
     except json.JSONDecodeError as exc:
-        return None, f"Error: tool arguments are not valid JSON ({exc})."
+        return None, False, f"Error: tool arguments are not valid JSON ({exc})."
     command = arguments.get("command") if isinstance(arguments, dict) else None
     if not isinstance(command, str) or not command.strip():
-        return None, "Error: the bash tool needs a non-empty string `command`."
-    return command, None
+        return None, False, "Error: the bash tool needs a non-empty string `command`."
+    background = arguments.get("background", False)
+    if not isinstance(background, bool):
+        return None, False, "Error: the bash tool's `background` must be true or false."
+    return command, background, None
 
 
 def _load_state(state_path):
@@ -333,24 +363,88 @@ class Agent:
             ),
         }
 
+    def _collect_deliveries(self):
+        """Exited background tasks' records for the result being assembled.
+
+        Pops at most BACKGROUND_DELIVERY_LIMIT tasks, in exit order, and renders
+        one record per task: the full output is gated like any observation and
+        then bounded on its own, so a burst of finished tasks cannot flood the
+        context. Returns (text, stubs): `text` is the block appended to the tool
+        result that triggered the collection, `stubs` the matching transcript
+        lines. Records beyond the limit stay queued for the next collection.
+        """
+        tasks = self.environment.pop_finished(BACKGROUND_DELIVERY_LIMIT)
+        if not tasks:
+            return "", ""
+        cap = self.compact["command_observation_chars"]
+        records = []
+        stubs = ""
+        for task in tasks:
+            raw = Path(task.log_path).read_text(errors="replace")
+            gated, note = gate_output(raw)
+            bounded = truncate_observation(gated, cap) if gated else "<no output>"
+            if note:
+                bounded = f"[{note}]\n{bounded}"
+            if task.killed:
+                outcome = (f"terminated at the {self.environment.cap_label()} cap: "
+                           f"code {task.returncode}")
+            else:
+                outcome = f"exited: code {task.returncode}"
+            command = task.command.replace("\n", " ")
+            if len(command) > 80:
+                command = command[:80] + "…"
+            record = render(
+                self.templates["background_exit"],
+                task_id=task.id,
+                outcome=outcome,
+                seconds=round(task.duration),
+                command=command,
+                log=task.log_path,
+                output=bounded,
+            ).rstrip("\n")
+            records.append(record)
+            stubs += Transcript.background_exit_stub(task.id, task.returncode, raw,
+                                                     task.log_path)
+        return "\n\n".join(records), stubs
+
+    def _running_phrase(self, tasks):
+        """One phrase naming the background tasks still running, for a reminder."""
+        cap = self.environment.cap_label()
+
+        def desc(task):
+            return (f"(pid {task.pid}, {round(time.monotonic() - task.started)} s of "
+                    f"{cap}; log {task.log_path})")
+
+        if len(tasks) == 1:
+            return f"background task {tasks[0].id} is still running {desc(tasks[0])}"
+        items = [f"{task.id} {desc(task)}" for task in tasks]
+        return ("background tasks " + ", ".join(items[:-1]) + " and " + items[-1]
+                + " are still running")
+
     def _run_tool_calls(self, step_idx, thought, tool_calls):
         """Run every call in order, appending one tool message per call.
 
         Every observation passes the control-marker gate on its complete output
         first, then the per-command cap: bounding decides what enters the
         context, never whether the command runs. The transcript gets one stub
-        line per call naming the log file that holds the full output.
+        line per call naming the log file that holds the full output. A
+        background call returns at once; after each call's own work is done, the
+        records of background tasks that exited meanwhile ride appended to the
+        same result, at most BACKGROUND_DELIVERY_LIMIT of them.
         """
         records = []
         cap = self.compact["command_observation_chars"]
         for index, tool_call in enumerate(tool_calls, start=1):
             step_thought = thought if index == 1 else ""
-            command, error = tool_call_command(tool_call)
+            command, background, error = tool_call_command(tool_call)
             if error is not None:
                 bounded = truncate_observation(error, cap)
+                text, stubs = self._collect_deliveries()
+                if text:
+                    bounded += "\n\n" + text
                 self._append_message(
                     {"role": "tool", "tool_call_id": tool_call.get("id"), "content": bounded},
-                    record=Transcript.invalid_call_stub(error),
+                    record=Transcript.invalid_call_stub(error) + stubs,
                 )
                 records.append({"thought": step_thought, "command": None,
                                 "observation": bounded, "note": "invalid tool call"})
@@ -361,13 +455,29 @@ class Agent:
                 self.emit({"type": "command", "step": step_idx,
                            "id": event_id, "command": command})
 
+            if background:
+                task = self.environment.start_background(command, step_idx, index)
+                body = render(self.templates["background_started"],
+                              task_id=task.id, pid=task.pid,
+                              log=task.log_path).rstrip("\n")
+                text, stubs = self._collect_deliveries()
+                content = body + ("\n\n" + text if text else "")
+                if self.emit:
+                    self.emit({"type": "observation", "step": step_idx,
+                               "id": event_id, "returncode": None,
+                               "background": True, "output": content})
+                self._append_message(
+                    {"role": "tool", "tool_call_id": tool_call.get("id"), "content": content},
+                    record=Transcript.background_start_stub(task.pid, task.log_path) + stubs,
+                )
+                records.append({"thought": step_thought, "command": command,
+                                "observation": content, "returncode": None,
+                                "note": "background"})
+                continue
+
             result = self.environment.execute(command, step_idx, index)
             output, note = gate_output(result["output"])
-            if self.emit:
-                self.emit({"type": "observation", "step": step_idx,
-                           "id": event_id, "returncode": result["returncode"],
-                           "output": output})
-
+            text, stubs = self._collect_deliveries()
             observation = render(
                 self.templates["observation"],
                 returncode=result["returncode"],
@@ -375,10 +485,16 @@ class Agent:
             )
             if note:
                 observation = f"[{note}]\n{observation}"
+            if text:
+                observation += "\n\n" + text
+            if self.emit:
+                self.emit({"type": "observation", "step": step_idx,
+                           "id": event_id, "returncode": result["returncode"],
+                           "output": output + ("\n\n" + text if text else "")})
             self._append_message(
                 {"role": "tool", "tool_call_id": tool_call.get("id"), "content": observation},
                 record=Transcript.tool_stub(result["returncode"], result["output"],
-                                            result["log_path"]),
+                                            result["log_path"]) + stubs,
             )
             records.append({"thought": step_thought, "command": command,
                             "observation": observation,
@@ -548,6 +664,23 @@ class Agent:
                     raise RuntimeError(f"Step {step_idx}: empty reply with no "
                                        "tool call; nothing to deliver.")
 
+                running = self.environment.running_background()
+                if running or self.environment.finished_pending():
+                    text, stubs = self._collect_deliveries()
+                    if running:
+                        body = render(self.templates["background_running_reminder"],
+                                      tasks=self._running_phrase(running))
+                    else:
+                        body = render(self.templates["background_delivered_reminder"])
+                    content = text + "\n\n" + body.rstrip() if text else body.rstrip()
+                    reminder = {"role": "user", "content": content}
+                    self._append_message(
+                        reminder, record=Transcript.user_record(reminder) + stubs
+                    )
+                    steps.append({"thought": reply, "command": None,
+                                  "observation": content, "note": "background pending"})
+                    continue
+
                 return {"task": task, "steps": steps, "completed": True,
                         "n_steps": step_idx, "final_output": reply,
                         "usage": self.model.usage()}
@@ -556,4 +689,10 @@ class Agent:
                 f"Step limit ({self.step_limit}) exceeded without task completion."
             )
         finally:
+            # Every exit path (completion, step limit, model error, SIGTERM and
+            # KeyboardInterrupt through main.py) leaves no background process:
+            # the main.py handlers kill what runs under them, and a task that
+            # outlives the loop is killed here, before the state is persisted.
+            if self.environment.running_background():
+                self.environment.kill_running()
             self._persist_messages()

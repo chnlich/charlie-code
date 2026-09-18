@@ -61,7 +61,7 @@ def test_command_past_the_cap_reports_each_tick_then_is_terminated(tmp_path):
     assert result["output"].startswith("started\n")
     assert f"[terminated after 0.8 s: still running as pid {pid}; " in result["output"]
     assert f"log: {result['log_path']}." in result["output"]
-    assert "wait for it as your role prompt describes.]" in result["output"]
+    assert "detached with setsid nohup as your role prompt describes.]" in result["output"]
     assert not _alive(pid)
     time.sleep(0.2)
     assert not _group_alive(pid)

@@ -74,11 +74,24 @@ templates:
 
     Use `rg` rather than `grep` to search in fs.
 
-    Long-running commands: a command runs in the foreground and returns when it exits; the tool waits for it and
-    reports progress to CharlieBot while it runs. A command still running after {{kill_after_minutes}} minutes is
-    terminated, and you get its output so far with a note saying so. Run a command in the foreground when you
-    expect it to finish within five minutes; start anything longer in its own session, `setsid nohup cmd > log
-    2>&1 & echo $!`, record its pid and log path, and wait for it as your role prompt describes.
+    Command duration: a command runs in the foreground and returns when it exits; a command
+    still running after {{kill_after_minutes}} minutes is terminated, and you get its output so far
+    with a note saying so. Run in the foreground a command you expect to finish within a minute,
+    or whose result you need before you can do anything else. Start anything you expect to
+    outlast {{kill_after_minutes}} minutes in its own session, `setsid nohup cmd > log 2>&1 & echo $!`,
+    record its pid and log path, and wait for it as your role prompt describes.
+
+    Background commands: `background: true` starts the command and returns at once with its task
+    id, pid and log path, and the command keeps running under the same {{kill_after_minutes}}-minute
+    cap. It suits a command you expect to take more than a minute while you have other work to do
+    meanwhile, such as a test run while you read the next file. Its exit code and output arrive
+    appended to a later tool result under a `[background task ...]` heading, so the result reaches
+    you without polling. When only that result remains, wait for it with
+    `timeout N tail --pid=PID -f LOG`, which returns when the task exits or after N seconds; stop a
+    task with `kill PID`. The parameter is the one way to run a command in the background: a
+    process forked with a trailing `&` belongs to the call's process group, which is reaped when
+    the call returns. Your final answer takes effect once every background task has ended; a reply
+    that ends the task while one is still running gets a reminder naming it.
 
     {{skills}}
 
@@ -104,6 +117,37 @@ templates:
     Exit code: {{returncode}}
     Output:
     {{output}}
+
+  # The tool result of a call made with background=true: the task id, pid and log
+  # path, and the commands that wait for or stop the task. Its exit record
+  # (background_exit) rides appended to a later tool result.
+  background_started: |
+    Background task {{task_id}} started: pid {{pid}}, log {{log}}.
+    Its exit code and output arrive appended to a later tool result.
+    Wait: timeout N tail --pid={{pid}} -f {{log}}   Stop: kill {{pid}}
+
+  # One exited background task, appended to a later tool result. outcome reads
+  # "exited: code N", or "terminated at the <cap> cap: code N" when the cap ended
+  # it; command is the command's first 80 characters; output is gated and bounded
+  # like any observation.
+  background_exit: |
+    [background task {{task_id}} {{outcome}} after {{seconds}} s; command: {{command}}; log: {{log}}]
+    Output:
+    {{output}}
+
+  # Appended when a reply ends the run while background tasks are still running.
+  # tasks reads "background task s-4-1 is still running (pid 12345, 130 s of
+  # 15 min; log /path/s-4-1.log)"; several tasks are listed in one phrase.
+  background_running_reminder: |
+    Your reply ended the task while {{tasks}}. Wait for it with
+    `timeout N tail --pid=PID -f LOG`, stop it with `kill PID`, or restart it detached with
+    setsid nohup if it must outlive this session; then send the final answer again.
+
+  # Appended when a reply ends the run while exited tasks' records were still
+  # undelivered; the records stand above it in the same message.
+  background_delivered_reminder: |
+    Your reply ended the task while background task results were still on their way; they
+    are above. Send the final answer again.
 
   # The one user message a rebuilt context carries besides the task. Rendered
   # once per session from the transcript's absolute path and the session's .d

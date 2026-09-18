@@ -114,6 +114,10 @@ class Environment:
         # Guards _background and _finished against the supervising threads.
         self._lock = threading.Lock()
 
+    def cap_label(self):
+        """The kill cap as notes and reminders name it ("15 min" at the default)."""
+        return _duration_label(self.kill_after_seconds)
+
     def _spawn(self, command, step, call):
         """Start `command` as its own session with output to its command log.
 
@@ -162,8 +166,9 @@ class Environment:
                 f"\n[terminated after {_duration_label(self.kill_after_seconds)}: "
                 f"still running as pid {proc.pid}; output so far above; log: "
                 f"{log_path}. Foreground commands are for work expected within "
-                f"5 min; start longer work detached with setsid nohup and wait "
-                f"for it as your role prompt describes.]"
+                f"a minute; run longer work with background=true, and start work "
+                f"longer than the cap detached with setsid nohup as your role "
+                f"prompt describes.]"
             )
         return {"output": output, "returncode": proc.returncode, "log_path": log_path}
 

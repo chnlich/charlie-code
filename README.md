@@ -157,10 +157,22 @@ harness like CharlieBot:
   there (default cap 900 seconds). The observation carries the output so far,
   the process's real exit code (-15 or -9), and a note naming the cap, the pid
   and the log path; a final `command_progress` event with `killed: true` marks
-  the termination. The system prompt tells the model to run only work expected
-  within five minutes in the foreground and to detach anything longer.
+  the termination. The system prompt tells the model to run in the foreground
+  only work expected within a minute, to start longer work with
+  `background: true`, and to detach anything expected to outlast the cap.
+- **A command can run in the background.** With `background: true` the `bash`
+  call returns at once with the task id, pid and log path, and a supervising
+  thread waits on the command under the same cap, reaps it the instant it exits,
+  and records its exit code. The record, its output bounded like any observation,
+  is appended to the next tool result that completes (at most four records per
+  result; the rest follow in exit order), so the model gets it without polling;
+  `timeout N tail --pid=PID -f LOG` waits for it explicitly and `kill PID` stops
+  it. A reply that ends the run while a task is still running gets a reminder
+  and the run continues; every exit path kills the remaining background groups,
+  so no task outlives the run.
 - **SIGTERM to charlie-code is a controlled exit.** The running command's process
-  group is SIGKILLed, the session state is persisted, and the process exits with
+  group and every background task's group are SIGKILLed, the session state is
+  persisted, and the process exits with
   status 143, inside the five-second window a supervisor allows before it
   escalates to SIGKILL.
 - **Escape hatch.** A command that daemonizes itself with `setsid` (a new session,

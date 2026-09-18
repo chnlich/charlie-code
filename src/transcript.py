@@ -22,6 +22,8 @@ have no header and no blank line, so they attach to the assistant record above.
     <reply text>
     $ <command>
     -> exit <code> · <chars> chars · <lines> lines · <log file>
+    -> background · pid <pid> · <log file>
+    -> background <task id> exit <code> · <chars> chars · <lines> lines · <log file>
 
     ## reset · <UTC time> · <trigger> · pre <n> tokens · post <n> tokens
 """
@@ -139,6 +141,21 @@ class Transcript:
         return (
             f"-> exit {returncode} · {len(output):,} chars · {line_count(output):,} lines"
             f" · {log_path}\n"
+        )
+
+    @staticmethod
+    def background_start_stub(pid, log_path):
+        """One line per background call: the pid and the log that will hold the
+        full output."""
+        return f"-> background · pid {pid} · {log_path}\n"
+
+    @staticmethod
+    def background_exit_stub(task_id, returncode, output, log_path):
+        """One line per exited background task, like tool_stub but naming the
+        task id instead of an exit the model watched happen."""
+        return (
+            f"-> background {task_id} exit {returncode} · {len(output):,} chars"
+            f" · {line_count(output):,} lines · {log_path}\n"
         )
 
     @staticmethod

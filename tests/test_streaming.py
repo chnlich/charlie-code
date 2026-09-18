@@ -204,7 +204,7 @@ def test_tool_call_deltas_reassemble_to_the_non_stream_shape():
     del expected["provider_specific_fields"]
     assert message == expected
     assert finish_reason == "tool_calls"
-    assert tool_call_command(message["tool_calls"][0]) == ("echo hi", None)
+    assert tool_call_command(message["tool_calls"][0]) == ("echo hi", False, None)
 
 
 def test_reasoning_deltas_survive_reassembly():
@@ -244,7 +244,7 @@ def test_fields_outside_the_rebuild_list_survive_on_the_returned_tool_call():
     tool_call = message["tool_calls"][0]
     assert tool_call["extra_content"] == {"google": {"thought_signature": "SIG"}}
     assert "index" not in tool_call
-    assert tool_call_command(tool_call) == ("echo hi", None)
+    assert tool_call_command(tool_call) == ("echo hi", False, None)
     assert finish_reason == "tool_calls"
 
 
