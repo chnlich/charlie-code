@@ -3,6 +3,7 @@ per message as it enters the context, before the state file, across resets and
 resumes."""
 
 import json
+from pathlib import Path
 
 from litellm.exceptions import ContextWindowExceededError
 
@@ -57,6 +58,12 @@ def _state_file(tmp_path, name="abc"):
 
 def _transcript_text(state_file):
     return (state_file.parent / f"{state_file.stem}.d" / "transcript.md").read_text()
+
+
+def _pointer(state_file):
+    session_dir = Path(state_file).with_suffix(".d")
+    return render(load_config()["templates"]["reset_pointer"],
+                  transcript=str(session_dir / "transcript.md"), session_dir=str(session_dir))
 
 
 # --- record shapes ---------------------------------------------------------------
@@ -126,7 +133,7 @@ def test_agent_records_each_message_as_it_enters_the_context(tmp_path):
     assert "\n## assistant · step 2 · " in text
     assert "\ndeep thought\nDone.\n" in text
     assert "## system" not in text
-    assert "Prior context" not in text
+    assert _pointer(state_file) not in text
 
 
 def test_reminders_are_recorded_as_user_records(tmp_path):
@@ -154,7 +161,7 @@ def test_a_reset_adds_a_reset_record_and_keeps_the_pointer_out(tmp_path):
     assert user_index < reset_index < text.index("\n## assistant · step 1 · ")
     reset_line = text[reset_index + 1:].splitlines()[0]
     assert " · overflow · pre " in reset_line and " tokens · post " in reset_line
-    assert "Prior context" not in text
+    assert _pointer(state_file) not in text
 
 
 def test_a_resume_appends_to_the_same_transcript(tmp_path):

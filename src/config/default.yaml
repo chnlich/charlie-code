@@ -120,4 +120,7 @@ templates:
   # once per session from the transcript's absolute path and the session's .d
   # directory (command logs, one file per command), so it is byte-identical for
   # the whole session.
-  reset_pointer: "Prior context: {{transcript}}; command outputs under {{session_dir}}/. Use rg."
+  reset_pointer: >-
+    Context was rebuilt; your earlier work is recorded on disk. Step log:
+    {{transcript}}. Full command outputs: {{session_dir}}/. Start by running rg on
+    these two paths to pick up where you left off.
