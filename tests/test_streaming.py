@@ -268,6 +268,115 @@ def test_non_contiguous_delta_indexes_align_by_index_not_position():
     assert all("index" not in tc for tc in message["tool_calls"])
 
 
+A = '{"background":true,"command":"sleep 20; echo done"}'
+B = '{"command":"ls -la"}'
+
+
+def test_parallel_calls_sharing_one_index_come_back_as_separate_calls():
+    """Gemini's endpoint streams parallel calls all at index 0, one id per call;
+    the rebuild groups fragments by index alone, so without the id-based split
+    the two calls fuse into one whose arguments are two JSON objects end to end."""
+    plan = [
+        (0.0, delta_chunk({"role": "assistant", "content": None})),
+        (0.0, signature_delta(0, "call_237700", A, "SIG-A")),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 0, "id": "call_237702", "type": "function",
+             "function": {"name": "bash", "arguments": B}}]})),
+        (0.0, finish_chunk("tool_calls")),
+        (0.0, usage_chunk(11, 5)),
+    ]
+    with endpoint(plan) as base:
+        model = Model(model_name="openai/fake", api_base=base, api_key="x",
+                      timeout_seconds=5, stream=True)
+        message, _ = model.query([{"role": "user", "content": "hi"}])
+    calls = message["tool_calls"]
+    assert [tc["id"] for tc in calls] == ["call_237700", "call_237702"]
+    assert [tc["function"]["arguments"] for tc in calls] == [A, B]
+    assert calls[0]["extra_content"] == {"google": {"thought_signature": "SIG-A"}}
+    assert "extra_content" not in calls[1]
+    assert all("index" not in tc for tc in calls)
+    assert [tool_call_command(tc) for tc in calls] == [
+        ("sleep 20; echo done", True, None), ("ls -la", False, None)]
+
+
+def test_openai_shaped_parallel_calls_are_unchanged_by_the_split():
+    """OpenAI gives each parallel call its own index and rides its continuations
+    on that index; the split must leave that shape's index sequence untouched."""
+    plan = [
+        (0.0, delta_chunk({"role": "assistant", "content": None})),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 0, "id": "call-1", "type": "function",
+             "function": {"name": "bash", "arguments": ""}}]})),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 0, "function": {"arguments": A[:9]}}]})),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 0, "function": {"arguments": A[9:]}}]})),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 1, "id": "call-2", "type": "function",
+             "function": {"name": "bash", "arguments": ""}}]})),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 1, "function": {"arguments": B}}]})),
+        (0.0, delta_chunk({"tool_calls": [
+            {"index": 0, "function": {"arguments": ""}}]})),
+        (0.0, finish_chunk("tool_calls")),
+        (0.0, usage_chunk(11, 5)),
+    ]
+    with endpoint(plan) as base:
+        model = Model(model_name="openai/fake", api_base=base, api_key="x",
+                      timeout_seconds=5, stream=True)
+        message, _ = model.query([{"role": "user", "content": "hi"}])
+    calls = message["tool_calls"]
+    assert [tc["id"] for tc in calls] == ["call-1", "call-2"]
+    assert [tc["function"]["arguments"] for tc in calls] == [A, B]
+    assert all("index" not in tc for tc in calls)
+
+
+def test_separate_tool_call_fragments_assigns_one_index_per_id():
+    """Unit view of the split: one index per distinct id, id-less continuations
+    follow the id current at their original index, and the OpenAI shape's index
+    sequence passes through unchanged."""
+    from litellm.types.utils import ModelResponseStream
+
+    def fragment(index, tool_id=None, name=None, arguments=""):
+        call = {"index": index, "function": {"arguments": arguments}}
+        if name is not None:
+            call["function"]["name"] = name
+        if tool_id is not None:
+            call["id"] = tool_id
+            call["type"] = "function"
+        return call
+
+    def rewritten_indexes(deltas):
+        chunks = [ModelResponseStream(**delta_chunk({"tool_calls": [d]})) for d in deltas]
+        assert model.separate_tool_call_fragments(chunks) is chunks
+        return [tc.index for c in chunks for ch in c.choices
+                for tc in (ch.delta.tool_calls or [])]
+
+    # Gemini: two parallel calls, both streamed at index 0.
+    assert rewritten_indexes([fragment(0, "call-a"), fragment(0, "call-b")]) == [0, 1]
+    # Mixed: the id-less fragment joins the id now current at index 0.
+    assert rewritten_indexes([
+        fragment(0, "call-a"), fragment(0, "call-b"), fragment(0)]) == [0, 1, 1]
+    # Name and arguments arrive before the id; the inherited placeholder keeps
+    # its slot, so new indexes need not be contiguous.
+    assert rewritten_indexes([
+        fragment(0, name="bash", arguments='{"fir'),
+        fragment(0, "call-nf", arguments='st":1}'),
+        fragment(1, "call-2", name="bash", arguments=B),
+    ]) == [0, 0, 2]
+    # A fragment that never gets an id keeps its own new index.
+    assert rewritten_indexes([fragment(0, "call-a"), fragment(1)]) == [0, 1]
+    # OpenAI shape: each call its own index, id only on its first fragment.
+    assert rewritten_indexes([
+        fragment(0, "call-1"),
+        fragment(0, arguments=A[:9]),
+        fragment(0, arguments=A[9:]),
+        fragment(1, "call-2"),
+        fragment(1, arguments=B),
+        fragment(0, arguments=""),
+    ]) == [0, 0, 0, 1, 1, 0]
+
+
 TOOLCALL_REPLY_WITH_SIGNATURE = {
     "role": "assistant", "content": None, "reasoning_content": "think think",
     "tool_calls": [{"id": "call-1", "type": "function",

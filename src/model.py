@@ -27,7 +27,10 @@ field list and silently drops anything else - Gemini's OpenAI-compatible
 endpoint, for one, carries the thought signature on
 `tool_call.extra_content.google`, and losing it turns the next turn into a 400.
 So after every rebuild `merge_stream_tool_call_fields` merges back every field
-the raw deltas carried that the rebuild does not produce. No option or config
+the raw deltas carried that the rebuild does not produce. The rebuild also
+groups tool-call fragments by index alone, and Gemini's endpoint streams
+parallel calls all at index 0, so `separate_tool_call_fragments` first gives
+each distinct id its own index. No option or config
 value gates this: handing back exactly what the endpoint sent is the invariant,
 not a mode.
 
@@ -143,6 +146,37 @@ def merge_stream_tool_call_fields(message, chunks):
     return message
 
 
+def separate_tool_call_fragments(chunks):
+    """Rewrite each streamed tool-call fragment's index so every distinct id
+    owns one index.
+
+    The rebuild groups tool-call fragments by index alone, and Gemini's
+    OpenAI-compatible endpoint streams parallel calls all at index 0, so two
+    parallel calls would come back fused into one. A distinct id inherits the
+    slot of any id-less fragments already at its original index, and later
+    id-less fragments at that index follow the id now current there.
+    """
+    index_of_key = {}
+    key_at_original = {}
+    for chunk in chunks:
+        # Duck-typed like the merge step: a chunk with no choices
+        # attribute carries no fragments, so there is nothing to rewrite.
+        for choice in getattr(chunk, "choices", ()) or []:
+            for tool_call in (choice.delta.tool_calls or []):
+                original = tool_call.index if tool_call.index is not None else 0
+                if tool_call.id:
+                    pending = key_at_original.get(original)
+                    if (pending is not None and pending[0] == "index"
+                            and ("id", tool_call.id) not in index_of_key):
+                        # id-less fragments already seen at this index belong to this call
+                        index_of_key[("id", tool_call.id)] = index_of_key[pending]
+                    key_at_original[original] = ("id", tool_call.id)
+                key = key_at_original.get(original, ("index", original))
+                key_at_original[original] = key
+                tool_call.index = index_of_key.setdefault(key, len(index_of_key))
+    return chunks
+
+
 class Model:
     def __init__(self, model_name, api_base, api_key, timeout_seconds, stream,
                  top_p=None, temperature=None):
@@ -226,6 +260,7 @@ class Model:
                     )
                     for chunk in stream:
                         chunks.append(chunk)
+                    separate_tool_call_fragments(chunks)
                     response = litellm.stream_chunk_builder(chunks, messages=messages)
                 else:
                     response = litellm.completion(
