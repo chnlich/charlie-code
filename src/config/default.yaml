@@ -86,9 +86,9 @@ templates:
     cap. It suits a command you expect to take more than a minute while you have other work to do
     meanwhile, such as a test run while you read the next file. Its exit code and output arrive
     appended to a later tool result under a `[background task ...]` heading, so the result reaches
-    you without polling. When only that result remains, wait for it with
-    `timeout N tail --pid=PID -f LOG`, which returns when the task exits or after N seconds; stop a
-    task with `kill PID`. The parameter is the one way to run a command in the background: a
+    you without polling. When only that result remains, `timeout N tail --pid=PID -f LOG` returns
+    when the task exits or after N seconds; `kill PID` stops a task. The parameter is the one way
+    to run a command in the background: a
     process forked with a trailing `&` belongs to the call's process group, which is reaped when
     the call returns. Your final answer takes effect once every background task has ended; a reply
     that ends the task while one is still running gets a reminder naming it.
@@ -124,7 +124,8 @@ templates:
   background_started: |
     Background task {{task_id}} started: pid {{pid}}, log {{log}}.
     Its exit code and output arrive appended to a later tool result.
-    Wait: timeout N tail --pid={{pid}} -f {{log}}   Stop: kill {{pid}}
+    `timeout N tail --pid={{pid}} -f {{log}}` returns when the task exits or after N seconds;
+    `kill {{pid}}` stops it.
 
   # One exited background task, appended to a later tool result. outcome reads
   # "exited: code N", or "terminated at the <cap> cap: code N" when the cap ended
@@ -139,9 +140,11 @@ templates:
   # tasks reads "background task s-4-1 is still running (pid 12345, 130 s of
   # 15 min; log /path/s-4-1.log)"; several tasks are listed in one phrase.
   background_running_reminder: |
-    Your reply ended the task while {{tasks}}. Wait for it with
-    `timeout N tail --pid=PID -f LOG`, stop it with `kill PID`, or restart it detached with
-    setsid nohup if it must outlive this session; then send the final answer again.
+    Your reply ended the task while {{tasks}}. Your final answer takes effect once
+    every background task has ended. `timeout N tail --pid=PID -f LOG` returns when
+    the task exits or after N seconds. `kill PID` stops a task. When a task must
+    outlive this session, `setsid nohup` restarts it detached. Send the final
+    answer again.
 
   # Appended when a reply ends the run while exited tasks' records were still
   # undelivered; the records stand above it in the same message.

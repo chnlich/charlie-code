@@ -166,9 +166,10 @@ harness like CharlieBot:
   and records its exit code. The record, its output bounded like any observation,
   is appended to the next tool result that completes (at most four records per
   result; the rest follow in exit order), so the model gets it without polling;
-  `timeout N tail --pid=PID -f LOG` waits for it explicitly and `kill PID` stops
-  it. A reply that ends the run while a task is still running gets a reminder
-  and the run continues; every exit path kills the remaining background groups,
+  `timeout N tail --pid=PID -f LOG` returns when the task exits or after N
+  seconds, and `kill PID` stops it. A reply that ends the run while a task is
+  still running gets a reminder and the run continues; every exit path kills
+  the remaining background groups,
   so no task outlives the run.
 - **SIGTERM to charlie-code is a controlled exit.** The running command's process
   group and every background task's group are SIGKILLed, the session state is
