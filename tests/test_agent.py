@@ -13,7 +13,8 @@ from conftest import ScriptedModel, assistant, tool_call
 from environment import Environment
 
 
-def _agent(tmp_path, templates, *replies, step_limit=5, emit=None):
+def _agent(tmp_path, templates, *replies, step_limit=5, emit=None,
+           state_file=None, resume=False, instructions_file=None):
     return Agent(
         model=ScriptedModel(*replies),
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
@@ -21,6 +22,9 @@ def _agent(tmp_path, templates, *replies, step_limit=5, emit=None):
         templates=templates,
         step_limit=step_limit,
         emit=emit,
+        state_file=state_file,
+        resume=resume,
+        instructions_file=instructions_file,
     )
 
 
@@ -257,6 +261,39 @@ def test_undecodable_agents_md_warns_on_stderr_and_session_continues(
     assert str(agents_md) in err
 
 
+def test_fresh_session_without_agents_md_reads_claude_md_then_rules_in_name_order(
+        tmp_path, templates):
+    (tmp_path / "CLAUDE.md").write_text("claude guide\n", encoding="utf-8")
+    rules = tmp_path / ".claude" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "b-second.md").write_text("second rule\n", encoding="utf-8")
+    (rules / "a-first.md").write_text("first rule\n", encoding="utf-8")
+    agent = _agent(tmp_path, templates, assistant("done"))
+
+    agent.run("count")
+
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      kill_after_minutes=f"{10 / 60:g}")
+    texts = ["claude guide\n", "first rule\n", "second rule\n"]
+    assert agent.messages[0]["content"] == template + "\n\n" + "\n\n".join(texts)
+
+
+def test_agents_md_alone_is_the_guide_when_claude_md_and_rules_also_exist(
+        tmp_path, templates):
+    (tmp_path / "AGENTS.md").write_text("agents guide\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("claude guide\n", encoding="utf-8")
+    rules = tmp_path / ".claude" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "a-first.md").write_text("first rule\n", encoding="utf-8")
+    agent = _agent(tmp_path, templates, assistant("done"))
+
+    agent.run("count")
+
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      kill_after_minutes=f"{10 / 60:g}")
+    assert agent.messages[0]["content"] == template + "\n\nagents guide\n"
+
+
 def test_resume_replays_stored_system_text_without_rereading_agents_md(
         tmp_path, templates):
     agents_md = tmp_path / "AGENTS.md"
@@ -288,3 +325,39 @@ def test_resume_replays_stored_system_text_without_rereading_agents_md(
 
     assert resumed.messages[0]["content"] == original_system
     assert "changed convention" not in resumed.messages[0]["content"]
+
+
+def test_fresh_session_appends_instructions_file_after_the_repo_guide(tmp_path, templates):
+    (tmp_path / "AGENTS.md").write_text("repo guide\n", encoding="utf-8")
+    instructions = tmp_path / "harness.md"
+    instructions.write_text("harness rules\n", encoding="utf-8")
+    agent = _agent(tmp_path, templates, assistant("done"),
+                   instructions_file=str(instructions))
+
+    agent.run("count")
+
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      kill_after_minutes=f"{10 / 60:g}")
+    assert agent.messages[0]["content"] == (
+        template + "\n\nrepo guide\n" + "\n\nharness rules\n"
+    )
+
+
+def test_resumed_session_keeps_recorded_system_message_with_instructions_file(
+        tmp_path, templates):
+    instructions = tmp_path / "harness.md"
+    instructions.write_text("original rules\n", encoding="utf-8")
+    state_file = str(tmp_path / "session.json")
+    first = _agent(tmp_path, templates, assistant("done"), state_file=state_file,
+                   instructions_file=str(instructions))
+    first.run("count")
+    original_system = first.messages[0]["content"]
+    assert original_system.endswith("original rules\n")
+
+    instructions.write_text("changed rules\n", encoding="utf-8")
+    resumed = _agent(tmp_path, templates, assistant("done again"),
+                     state_file=state_file, resume=True,
+                     instructions_file=str(instructions))
+    resumed.run("count again")
+
+    assert resumed.messages[0]["content"] == original_system

@@ -216,25 +216,49 @@ def repair_dangling_tool_calls(messages):
     return added
 
 
-def read_agents_md(cwd):
-    """The cwd's AGENTS.md text for a fresh session's system message, or "".
+def _read_guide_file(path):
+    """One repository-guide file's text, or "" when it is missing or unreadable.
 
-    The file is an environment convention scanned at startup, like CLAUDE.md for
-    Claude Code, not something the run selected -- so a missing or blank file is
-    simply no convention (silent), while an unreadable one must not kill a
-    session launched for an unrelated task: one stderr warning, then continue
-    without it. Resumed sessions never get here; their history already carries
-    whatever the file said when they were fresh.
+    A guide file is an environment convention scanned at startup, not something
+    the run selected, so a missing file is silent. An unreadable one must not
+    kill a session launched for an unrelated task: one stderr warning, then the
+    session continues without it.
     """
-    path = Path(cwd) / "AGENTS.md"
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
     except (UnicodeDecodeError, OSError) as exc:
         print(f"warning: skipping unreadable {path}: {exc}", file=sys.stderr)
         return ""
-    return text if text.strip() else ""
+
+
+def read_repo_guide(cwd):
+    """The repository guide text for a fresh session's system message, or "".
+
+    AGENTS.md alone when the working directory holds one. Otherwise CLAUDE.md,
+    then each .claude/rules/*.md file in file-name order. Blank files contribute
+    nothing; the texts that remain are joined by a blank line.
+    """
+    root = Path(cwd)
+    if (root / "AGENTS.md").exists():
+        paths = [root / "AGENTS.md"]
+    else:
+        paths = [root / "CLAUDE.md", *sorted((root / ".claude" / "rules").glob("*.md"))]
+    texts = [_read_guide_file(path) for path in paths]
+    return "\n\n".join(text for text in texts if text.strip())
+
+
+def read_instructions_file(path):
+    """The full UTF-8 text of --instructions-file, for a fresh session's system message.
+
+    The caller named this file, so it must be readable: a missing or undecodable
+    file raises before the session's first model call, naming the path.
+    """
+    try:
+        return Path(path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"--instructions-file: cannot read {path!r}: {exc}") from None
 
 
 class Agent:
@@ -250,6 +274,7 @@ class Agent:
         resume=False,
         compact=None,
         images=(),
+        instructions_file=None,
     ):
         self.model = model
         self.environment = environment
@@ -264,6 +289,7 @@ class Agent:
         self.resume = resume
         self.compact = compact if compact is not None else load_config()["compact"]
         self.images = list(images)
+        self.instructions_file = instructions_file
         self.messages = []
         # This turn's task message: the third message of every rebuilt context.
         self._task = None
@@ -287,10 +313,11 @@ class Agent:
         """History before this turn's task message.
 
         A resumed session's file is loaded and repaired; a fresh session starts
-        from its system message alone. The task message itself enters through
-        `_append_message` in `run`, so it reaches the state file before the
-        first model call. `--resume` names an explicit target, so a missing
-        state file is an error, never a silent fresh start.
+        from its system message alone, and only a fresh session reads the
+        repository guide and the instructions file. The task message itself
+        enters through `_append_message` in `run`, so it reaches the state file
+        before the first model call. `--resume` names an explicit target, so a
+        missing state file is an error, never a silent fresh start.
         """
         if self.resume:
             state_path = Path(self.state_file) if self.state_file else None
@@ -310,9 +337,11 @@ class Agent:
             skills=self.skills_catalog,
             kill_after_minutes=f"{self.environment.kill_after_seconds / 60:g}",
         )
-        agents_md = read_agents_md(self.environment.cwd)
-        if agents_md:
-            system += "\n\n" + agents_md
+        guide = read_repo_guide(self.environment.cwd)
+        if guide:
+            system += "\n\n" + guide
+        if self.instructions_file is not None:
+            system += "\n\n" + read_instructions_file(self.instructions_file)
         return [{"role": "system", "content": system}]
 
     def _record(self, record):

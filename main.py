@@ -174,6 +174,13 @@ def run(
         "--skills-root",
         help="Host-level Agent Skills root; replaces the configured roots for this run.",
     ),
+    instructions_file: str = typer.Option(
+        None,
+        "--instructions-file",
+        help="Append PATH's full UTF-8 text to the system message of a fresh session, "
+        "after the repository guide. A resumed session keeps its recorded system "
+        "message and does not read PATH.",
+    ),
     resume: str = typer.Option(None, "--resume", help="Resume a previous session id."),
     session_dir: str = typer.Option(
         None, "--session-dir", help="Session state directory override."
@@ -322,6 +329,7 @@ def run(
         resume=resume is not None,
         images=images,
         compact=config["compact"],
+        instructions_file=instructions_file,
     )
     _install_sigterm_handler(agent)
 

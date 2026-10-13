@@ -256,6 +256,32 @@ def test_resuming_a_missing_session_fails_loudly(tmp_path, monkeypatch, task_fil
     assert not (session_dir / "ghost.json").exists()
 
 
+def test_fresh_session_with_missing_instructions_file_fails_naming_the_path(
+    tmp_path, monkeypatch, task_file
+):
+    """A fresh session names its instructions file, so a missing one stops the run
+    before the first model call and the error names the path."""
+    session_dir = tmp_path / "sessions"
+    queries = []
+    monkeypatch.setattr(
+        Model, "query", lambda self, messages, tools=None: queries.append(messages)
+    )
+    missing = tmp_path / "no-such-rules.md"
+
+    result = CliRunner().invoke(
+        _cli_app(),
+        ["--task-file", task_file("turn one"), "--json",
+         "--instructions-file", str(missing), "--cwd", str(tmp_path),
+         "--session-dir", str(session_dir), "--steps", "2"],
+    )
+
+    assert result.exit_code != 0
+    error = _json_lines(result.stdout)[-1]
+    assert error["type"] == "error"
+    assert str(missing) in error["message"]
+    assert queries == []
+
+
 def test_retried_model_call_persists_only_the_delivered_reply(
     tmp_path, monkeypatch, task_file
 ):

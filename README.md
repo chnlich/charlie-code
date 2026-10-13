@@ -40,7 +40,7 @@ the installed copy is the new code, failing loudly on any step.
 ## Run
 
 ```bash
-charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL] [--cwd DIR] [--steps N] [--stream|--no-stream] [--timeout-seconds N]
+charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL] [--cwd DIR] [--instructions-file PATH] [--steps N] [--stream|--no-stream] [--timeout-seconds N]
 ```
 
 - `--task-file PATH` (required) supplies the task text: the file's full UTF-8
@@ -52,6 +52,9 @@ charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL]
   given; with no `--image` the message is the plain-text form. Images persist
   verbatim in the session history and resume unchanged.
 - `--cwd` is the repo the agent operates in (default: current directory).
+- `--instructions-file PATH` appends the file's full UTF-8 text to the system
+  message of a fresh session; see the next section for its place in the system
+  message.
 - `--steps` is the hard step limit (default: 1000). Exceeding it fails loudly.
 - `--stream` / `--no-stream` selects how the model call is made (default: the
   configured `model.stream`, streaming). Under streaming the call stays alive as
@@ -75,14 +78,25 @@ charlie-code --task-file /tmp/demo-task.md --cwd /tmp/demo
 The full trajectory (thought / command / observation per step) is printed to stdout,
 followed by a summary line with step count and token usage.
 
-### AGENTS.md convention
+### Repository guide and instructions file
 
-On a **fresh** session start, charlie-code reads `AGENTS.md` from the working
-directory (`--cwd`): when the file is present, its full text is appended after
-the rendered system template in the system message. A missing or whitespace-only
-file is silently skipped; a file that cannot be read or decoded as UTF-8
-produces one stderr warning naming the file, and the session continues without
-it. Resumed sessions replay the stored history and never re-read the file.
+On a **fresh** session start, charlie-code builds the system message from the
+rendered system template, then appends two optional texts in this order, each
+after a blank line:
+
+1. The repository guide, read from the working directory (`--cwd`). When the
+   directory holds `AGENTS.md`, that file alone is the guide. Otherwise the guide
+   is `CLAUDE.md`, followed by each `.claude/rules/*.md` file in file-name order.
+2. The `--instructions-file PATH` text, when the option is given.
+
+A missing or whitespace-only guide file is silently skipped. A guide file that
+cannot be read or decoded as UTF-8 produces one stderr warning naming the file,
+and the session continues without it. The instructions file is required instead:
+a missing or undecodable one ends the run before the first model call, with an
+error naming the path.
+
+Resumed sessions replay the stored history and never read the guide or the
+instructions file, so the option has no effect on them.
 
 ### Skills
 
