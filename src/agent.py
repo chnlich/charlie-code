@@ -236,17 +236,28 @@ def _read_guide_file(path):
 def read_repo_guide(cwd):
     """The repository guide text for a fresh session's system message, or "".
 
-    AGENTS.md alone when the working directory holds one. Otherwise CLAUDE.md,
-    then each .claude/rules/*.md file in file-name order. Blank files contribute
-    nothing; the texts that remain are joined by a blank line.
+    Reads AGENTS.md, then CLAUDE.md, then each .claude/rules/*.md file in
+    file-name order: repositories point one guide file at the other in either
+    direction, so both names are read. When the two names resolve to the same
+    file (a symlink), the text enters once, under the AGENTS.md header. Each
+    file that is read contributes one block: a header line carrying the read
+    name's absolute path, then the text. Blank files contribute nothing; the
+    blocks that remain are joined by a blank line.
     """
     root = Path(cwd)
-    if (root / "AGENTS.md").exists():
-        paths = [root / "AGENTS.md"]
-    else:
-        paths = [root / "CLAUDE.md", *sorted((root / ".claude" / "rules").glob("*.md"))]
-    texts = [_read_guide_file(path) for path in paths]
-    return "\n\n".join(text for text in texts if text.strip())
+    agents_md, claude_md = root / "AGENTS.md", root / "CLAUDE.md"
+    paths = [agents_md]
+    if claude_md.resolve() != agents_md.resolve():
+        paths.append(claude_md)
+    paths.extend(sorted((root / ".claude" / "rules").glob("*.md")))
+    blocks = []
+    for path in paths:
+        text = _read_guide_file(path)
+        if text.strip():
+            header = (f"Contents of {path.absolute()} "
+                      "(project instructions, checked into the codebase):")
+            blocks.append(f"{header}\n{text}")
+    return "\n\n".join(blocks)
 
 
 def read_instructions_file(path):

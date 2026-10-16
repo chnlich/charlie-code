@@ -28,6 +28,12 @@ def _agent(tmp_path, templates, *replies, step_limit=5, emit=None,
     )
 
 
+def _guide_block(path, text):
+    """One guide file's system-message block: the source header, then the text."""
+    return (f"Contents of {path} (project instructions, checked into the codebase):"
+            f"\n{text}")
+
+
 def test_stop_with_text_completes_and_returns_it(tmp_path, templates):
     result = _agent(tmp_path, templates, assistant("All done: 3 files.")).run("count")
 
@@ -219,7 +225,8 @@ def test_fresh_session_appends_cwd_agents_md_to_system_message(tmp_path, templat
     template = render(templates["system"], cwd=str(tmp_path), skills="",
                       kill_after_minutes=f"{10 / 60:g}")
     content = agent.messages[0]["content"]
-    assert content == template + "\n\n" + agents_md.read_text(encoding="utf-8")
+    assert content == template + "\n\n" + _guide_block(
+        agents_md, agents_md.read_text(encoding="utf-8"))
     assert content.index("You have exactly one tool") < content.index(
         "Always run the test suite"
     )
@@ -274,16 +281,21 @@ def test_fresh_session_without_agents_md_reads_claude_md_then_rules_in_name_orde
 
     template = render(templates["system"], cwd=str(tmp_path), skills="",
                       kill_after_minutes=f"{10 / 60:g}")
-    texts = ["claude guide\n", "first rule\n", "second rule\n"]
-    assert agent.messages[0]["content"] == template + "\n\n" + "\n\n".join(texts)
+    blocks = [
+        _guide_block(tmp_path / "CLAUDE.md", "claude guide\n"),
+        _guide_block(rules / "a-first.md", "first rule\n"),
+        _guide_block(rules / "b-second.md", "second rule\n"),
+    ]
+    assert agent.messages[0]["content"] == template + "\n\n" + "\n\n".join(blocks)
 
 
-def test_agents_md_alone_is_the_guide_when_claude_md_and_rules_also_exist(
+def test_fresh_session_reads_agents_md_claude_md_then_rules_in_name_order(
         tmp_path, templates):
     (tmp_path / "AGENTS.md").write_text("agents guide\n", encoding="utf-8")
     (tmp_path / "CLAUDE.md").write_text("claude guide\n", encoding="utf-8")
     rules = tmp_path / ".claude" / "rules"
     rules.mkdir(parents=True)
+    (rules / "b-second.md").write_text("second rule\n", encoding="utf-8")
     (rules / "a-first.md").write_text("first rule\n", encoding="utf-8")
     agent = _agent(tmp_path, templates, assistant("done"))
 
@@ -291,7 +303,49 @@ def test_agents_md_alone_is_the_guide_when_claude_md_and_rules_also_exist(
 
     template = render(templates["system"], cwd=str(tmp_path), skills="",
                       kill_after_minutes=f"{10 / 60:g}")
-    assert agent.messages[0]["content"] == template + "\n\nagents guide\n"
+    blocks = [
+        _guide_block(tmp_path / "AGENTS.md", "agents guide\n"),
+        _guide_block(tmp_path / "CLAUDE.md", "claude guide\n"),
+        _guide_block(rules / "a-first.md", "first rule\n"),
+        _guide_block(rules / "b-second.md", "second rule\n"),
+    ]
+    assert agent.messages[0]["content"] == template + "\n\n" + "\n\n".join(blocks)
+
+
+def test_claude_md_symlinked_to_agents_md_is_read_once_under_agents_header(
+        tmp_path, templates):
+    """Both names of one guide file must not duplicate its text."""
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text("the one guide\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").symlink_to(agents_md)
+    agent = _agent(tmp_path, templates, assistant("done"))
+
+    agent.run("count")
+
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      kill_after_minutes=f"{10 / 60:g}")
+    assert agent.messages[0]["content"] == (
+        template + "\n\n" + _guide_block(agents_md, "the one guide\n")
+    )
+
+
+def test_fresh_session_without_claude_md_reads_agents_md_then_rules(
+        tmp_path, templates):
+    (tmp_path / "AGENTS.md").write_text("agents guide\n", encoding="utf-8")
+    rules = tmp_path / ".claude" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "only-rule.md").write_text("one rule\n", encoding="utf-8")
+    agent = _agent(tmp_path, templates, assistant("done"))
+
+    agent.run("count")
+
+    template = render(templates["system"], cwd=str(tmp_path), skills="",
+                      kill_after_minutes=f"{10 / 60:g}")
+    blocks = [
+        _guide_block(tmp_path / "AGENTS.md", "agents guide\n"),
+        _guide_block(rules / "only-rule.md", "one rule\n"),
+    ]
+    assert agent.messages[0]["content"] == template + "\n\n" + "\n\n".join(blocks)
 
 
 def test_resume_replays_stored_system_text_without_rereading_agents_md(
@@ -339,7 +393,8 @@ def test_fresh_session_appends_instructions_file_after_the_repo_guide(tmp_path, 
     template = render(templates["system"], cwd=str(tmp_path), skills="",
                       kill_after_minutes=f"{10 / 60:g}")
     assert agent.messages[0]["content"] == (
-        template + "\n\nrepo guide\n" + "\n\nharness rules\n"
+        template + "\n\n" + _guide_block(tmp_path / "AGENTS.md", "repo guide\n")
+        + "\n\nharness rules\n"
     )
 
 

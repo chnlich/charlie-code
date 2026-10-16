@@ -84,9 +84,13 @@ On a **fresh** session start, charlie-code builds the system message from the
 rendered system template, then appends two optional texts in this order, each
 after a blank line:
 
-1. The repository guide, read from the working directory (`--cwd`). When the
-   directory holds `AGENTS.md`, that file alone is the guide. Otherwise the guide
-   is `CLAUDE.md`, followed by each `.claude/rules/*.md` file in file-name order.
+1. The repository guide, read from the working directory (`--cwd`): `AGENTS.md`,
+   then `CLAUDE.md`, then each `.claude/rules/*.md` file in file-name order.
+   Both guide names are read because repositories point one at the other in
+   either direction; when the two resolve to the same file (a symlink), the
+   text enters once, under the `AGENTS.md` header. Each file's text follows
+   one header line: `Contents of <absolute path> (project instructions,
+   checked into the codebase):`.
 2. The `--instructions-file PATH` text, when the option is given.
 
 A missing or whitespace-only guide file is silently skipped. A guide file that
