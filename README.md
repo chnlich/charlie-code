@@ -175,16 +175,17 @@ harness like CharlieBot:
   the process's real exit code (-15 or -9), and a note naming the cap, the pid
   and the log path; a final `command_progress` event with `killed: true` marks
   the termination. The system prompt tells the model to run in the foreground
-  only work expected within a minute, to start longer work with
-  `background: true`, and to detach anything expected to outlast the cap.
+  each command expected to finish within the cap, and to start a command
+  expected to outlast the cap as its role prompt describes (detached in its
+  own session with `setsid nohup` when no such rule applies).
 - **A command can run in the background.** With `background: true` the `bash`
   call returns at once with the task id, pid and log path, and a supervising
   thread waits on the command under the same cap, reaps it the instant it exits,
   and records its exit code. The record, its output bounded like any observation,
   is appended to the next tool result that completes (at most four records per
   result; the rest follow in exit order), so the model gets it without polling;
-  `timeout N tail --pid=PID -f LOG` returns when the task exits or after N
-  seconds, and `kill PID` stops it. A reply that ends the run while a task is
+  `timeout <cap-minutes>m tail --pid=PID -f LOG` returns when the task exits or
+  at the cap, and `kill PID` stops it. A reply that ends the run while a task is
   still running gets a reminder and the run continues; every exit path kills
   the remaining background groups,
   so no task outlives the run.

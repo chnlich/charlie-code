@@ -76,18 +76,18 @@ templates:
 
     Command duration: a command runs in the foreground and returns when it exits; a command
     still running after {{kill_after_minutes}} minutes is terminated, and you get its output so far
-    with a note saying so. Run in the foreground a command you expect to finish within a minute,
-    or whose result you need before you can do anything else. Start anything you expect to
-    outlast {{kill_after_minutes}} minutes in its own session, `setsid nohup cmd > log 2>&1 & echo $!`,
-    record its pid and log path, and wait for it as your role prompt describes.
+    with a note saying so. Run in the foreground each command you expect to finish within
+    {{kill_after_minutes}} minutes. Start a command you expect to outlast {{kill_after_minutes}} minutes
+    as your role prompt describes. With no such rule, start it in its own session,
+    `setsid nohup cmd > log 2>&1 & echo $!`, and record its pid and log path.
 
     Background commands: `background: true` starts the command and returns at once with its task
     id, pid and log path, and the command keeps running under the same {{kill_after_minutes}}-minute
-    cap. It suits a command you expect to take more than a minute while you have other work to do
-    meanwhile, such as a test run while you read the next file. Its exit code and output arrive
-    appended to a later tool result under a `[background task ...]` heading, so the result reaches
-    you without polling. When only that result remains, `timeout N tail --pid=PID -f LOG` returns
-    when the task exits or after N seconds; `kill PID` stops a task. The parameter is the one way
+    cap. It suits a command that runs while you do other work, such as a test run while you read
+    the next file. Its exit code and output arrive appended to a later tool result under a
+    `[background task ...]` heading, so the result reaches you without polling. When only that
+    result remains, collect it with one call, `timeout {{kill_after_minutes}}m tail --pid=PID -f LOG`:
+    the cap ends the task within that time. `kill PID` stops a task. The parameter is the one way
     to run a command in the background: a
     process forked with a trailing `&` belongs to the call's process group, which is reaped when
     the call returns. Your final answer takes effect once every background task has ended; a reply
@@ -124,8 +124,8 @@ templates:
   background_started: |
     Background task {{task_id}} started: pid {{pid}}, log {{log}}.
     Its exit code and output arrive appended to a later tool result.
-    `timeout N tail --pid={{pid}} -f {{log}}` returns when the task exits or after N seconds;
-    `kill {{pid}}` stops it.
+    `timeout {{kill_after_minutes}}m tail --pid={{pid}} -f {{log}}` returns when the task exits
+    or after {{kill_after_minutes}} minutes; `kill {{pid}}` stops it.
 
   # One exited background task, appended to a later tool result. outcome reads
   # "exited: code N", or "terminated at the <cap> cap: code N" when the cap ended
@@ -141,8 +141,9 @@ templates:
   # 15 min; log /path/s-4-1.log)"; several tasks are listed in one phrase.
   background_running_reminder: |
     Your reply ended the task while {{tasks}}. Your final answer takes effect once
-    every background task has ended. `timeout N tail --pid=PID -f LOG` returns when
-    the task exits or after N seconds. `kill PID` stops a task. When a task must
+    every background task has ended. `timeout {{kill_after_minutes}}m tail --pid=PID -f LOG`
+    returns when the task exits or after {{kill_after_minutes}} minutes. `kill PID` stops a
+    task. When a task must
     outlive this session, `setsid nohup` restarts it detached. Send the final
     answer again.
 

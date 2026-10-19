@@ -165,10 +165,8 @@ class Environment:
             output += (
                 f"\n[terminated after {_duration_label(self.kill_after_seconds)}: "
                 f"still running as pid {proc.pid}; output so far above; log: "
-                f"{log_path}. Foreground commands are for work expected within "
-                f"a minute; run longer work with background=true, and start work "
-                f"longer than the cap detached with setsid nohup as your role "
-                f"prompt describes.]"
+                f"{log_path}. Start work longer than the cap as your role prompt "
+                f"describes.]"
             )
         return {"output": output, "returncode": proc.returncode, "log_path": log_path}
 

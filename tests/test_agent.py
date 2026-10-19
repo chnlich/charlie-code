@@ -199,7 +199,7 @@ def test_system_message_names_the_kill_cap_in_minutes(tmp_path, templates):
 
     system = agent.messages[0]["content"]
     assert "still running after 15 minutes is" in system
-    assert "{{kill_after_minutes}}" not in system
+    assert "{{" not in system, "no unrendered placeholder reaches the model"
 
 
 def test_system_message_orders_the_turn_end_rules_before_the_marker_rule(

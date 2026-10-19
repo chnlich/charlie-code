@@ -498,8 +498,9 @@ class Agent:
             if background:
                 task = self.environment.start_background(command, step_idx, index)
                 body = render(self.templates["background_started"],
-                              task_id=task.id, pid=task.pid,
-                              log=task.log_path).rstrip("\n")
+                              task_id=task.id, pid=task.pid, log=task.log_path,
+                              kill_after_minutes=f"{self.environment.kill_after_seconds / 60:g}"
+                              ).rstrip("\n")
                 text, stubs = self._collect_deliveries()
                 content = body + ("\n\n" + text if text else "")
                 if self.emit:
@@ -708,8 +709,11 @@ class Agent:
                 if running or self.environment.finished_pending():
                     text, stubs = self._collect_deliveries()
                     if running:
-                        body = render(self.templates["background_running_reminder"],
-                                      tasks=self._running_phrase(running))
+                        body = render(
+                            self.templates["background_running_reminder"],
+                            tasks=self._running_phrase(running),
+                            kill_after_minutes=f"{self.environment.kill_after_seconds / 60:g}",
+                        )
                     else:
                         body = render(self.templates["background_delivered_reminder"])
                     content = text + "\n\n" + body.rstrip() if text else body.rstrip()

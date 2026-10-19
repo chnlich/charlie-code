@@ -144,6 +144,36 @@ def test_reply_ending_with_a_running_task_is_reminded(tmp_path, templates):
         os.kill(pid, 0)
 
 
+def test_background_templates_render_the_wait_with_the_cap_in_minutes(tmp_path, templates):
+    """background_started and the running reminder write the wait as
+    `timeout 15m tail --pid=PID -f LOG`, with no placeholder left over."""
+    agent = Agent(
+        model=ScriptedModel(
+            assistant(tool_calls=[tool_call(1, command="sleep 1", background=True)]),
+            assistant("early"),
+            assistant(tool_calls=[tool_call(1, command="sleep 1.5; echo waited")]),
+            assistant("late"),
+        ),
+        environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
+                                kill_after_seconds=900, log_dir=str(tmp_path)),
+        templates=templates, step_limit=8,
+    )
+    try:
+        result = agent.run("task")
+    finally:
+        agent.environment.kill_running()
+
+    assert result["final_output"] == "late"
+    started = [m for m in agent.messages if m.get("role") == "tool"][0]
+    assert "timeout 15m tail --pid=" in started["content"]
+    assert "{{" not in started["content"], "no unrendered placeholder reaches the model"
+    reminders = [m for m in agent.messages
+                 if m.get("role") == "user" and "is still running" in m["content"]]
+    assert reminders, "the reply ending with the task still running drew a reminder"
+    assert "timeout 15m tail --pid=" in reminders[0]["content"]
+    assert "{{" not in reminders[0]["content"], "no unrendered placeholder reaches the model"
+
+
 def test_non_boolean_background_is_rejected_without_starting(tmp_path, templates):
     agent = _agent(
         tmp_path, templates,
