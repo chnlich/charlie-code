@@ -22,10 +22,11 @@ agent:
 
 # Context reset. Every command's output is bounded on its own before it enters
 # the context (command_observation_chars: head and tail halves around a one-line
-# marker stating the full output's totals). History is append-only and never
-# rewritten. Before each model call the agent estimates the context as the last
-# measured prompt_tokens plus chars/4 of what was appended since (chars/4 of the
-# whole context when there is no measurement yet); at or above
+# marker stating the full output's totals). Old step outputs, reasoning and long
+# command text leave the context together in batches; between batches the message
+# list stays byte-identical. Before each model call the agent estimates the
+# context as the last measured prompt_tokens plus chars/4 of what was appended
+# since (chars/4 of the whole context when there is no measurement yet); at or above
 # threshold_fraction * context_window it rebuilds the context as three messages:
 # the system message, a one-line pointer to the session's transcript and command
 # log directory (templates.reset_pointer), and this turn's task. Older material
