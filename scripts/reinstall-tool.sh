@@ -4,11 +4,17 @@
 # The host runs charlie-code from a non-editable `uv tool` install of this
 # checkout, so a merge to origin/main changes nothing until the checkout is
 # fast-forwarded and the tool is reinstalled from it. This script is that
-# recipe end to end, with the checks that prove the installed copy is the new
-# code: the reinstalled entry point runs, and its own interpreter imports an
-# Environment that has kill_running and no sweep, plus a Model that carries
-# the top_p/temperature sampling knobs. Any failing step exits non-zero; a
-# checkout that cannot fast-forward stops here for a human.
+# recipe end to end. The committed uv.lock pins every dependency version: it
+# exports to a constraints file, and the install runs under those constraints,
+# so a reinstall never re-resolves dependencies to the day's latest releases.
+# Before anything touches the live install, scripts/check-locked-install.sh
+# stages the same locked install in a temporary directory and proves its
+# request path with an offline request; the live install is replaced only
+# after that check passes. The reinstalled entry point then runs --help, and
+# its own interpreter imports an Environment that has kill_running and no
+# sweep, plus a Model that carries the top_p/temperature sampling knobs. Any
+# failing step exits non-zero; a checkout that cannot fast-forward stops here
+# for a human.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +23,12 @@ cd "$repo_root"
 git fetch origin
 git merge --ff-only origin/main
 
-uv tool upgrade --reinstall charlie-code
+scripts/check-locked-install.sh
+
+constraints="$(mktemp)"
+trap 'rm -f "$constraints"' EXIT
+uv export --locked --no-emit-project --no-hashes --no-dev -o "$constraints"
+uv tool install --reinstall --constraints "$constraints" "$repo_root"
 
 charlie-code --help > /dev/null
 

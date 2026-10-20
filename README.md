@@ -33,9 +33,16 @@ pip install -e ".[dev]"   # also installs pytest for the smoke test
 ```
 
 A host that runs charlie-code from a non-editable `uv tool` install of this checkout
-picks up a merge only after a reinstall: `scripts/reinstall-tool.sh` fast-forwards the
-checkout to `origin/main`, reinstalls the tool through `uv tool upgrade` and asserts
-the installed copy is the new code, failing loudly on any step.
+picks up a merge only after a reinstall, and the committed `uv.lock` pins the exact
+dependency versions the reinstall installs. `scripts/reinstall-tool.sh` is the one
+reinstall entry point: it fast-forwards the checkout to `origin/main`, stages the
+locked install in a temporary directory and proves its request path with an offline
+request check, and only then replaces the live install under the same constraints,
+failing loudly on any step. A direct `uv tool upgrade` skips the staged check and
+re-resolves dependencies outside the lock. To change a dependency version, run
+`scripts/upgrade-dependency.sh <package>[==<version>]`: it updates `uv.lock`, runs
+the test suite and the staged check against the locked versions, and the lock diff
+then lands as a commit of its own.
 
 ## Run
 
