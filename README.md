@@ -44,6 +44,19 @@ re-resolves dependencies outside the lock. To change a dependency version, run
 the test suite and the staged check against the locked versions, and the lock diff
 then lands as a commit of its own.
 
+### Landing a change
+
+A change lands on the published branch by a fast-forward push of the branch it was
+developed on, so the history stays linear and no merge commit is created. A host that
+runs the installed tool runs `scripts/reinstall-tool.sh` (above) to pick the change up.
+A run that is already in progress keeps the code it started with: the reinstall
+replaces the installed copy, not a process that has already loaded the old one.
+
+A review run of a proposed change starts from a scratch directory. The reviewer may
+check out the pull request in the caller's nearest clone, so a working directory inside
+another clone shares that checkout instead of an independent one. The verdict is the
+`final_output` field of the run's JSON result event.
+
 ## Run
 
 ```bash
@@ -157,10 +170,28 @@ The agent drives the endpoint's native tool calling: it offers exactly one tool,
   data into a real, executed call. The exit code still comes through, and the agent
   is told to re-read the content through a transform such as `base64`.
 - **Resuming.** Session files are stamped with the protocol they were recorded under;
-  a session from the older bash-block protocol is refused rather than replayed.
+  a session from the older bash-block protocol is refused rather than replayed. An
+  errored run leaves its session file in place, so the next message for that session id
+  (`--resume`) continues it.
 
 There is **no cost-based limit** — the SGLang model has no litellm pricing, so the only
 budget is the step count.
+
+### Context reset
+
+A long run stays inside the model's context window by rebuilding the context rather than
+summarizing it. Once the estimate reaches `compact.threshold_fraction` of
+`compact.context_window`, the message list becomes three messages: the system message, a
+pointer message and the run's task message. An over-window error from the endpoint runs
+the same reset and retries that call once; a second one raises.
+
+The pointer message is rendered from `templates.reset_pointer` the same way on every
+reset of a session, so the rebuilt prefix is byte-identical across resets and the
+endpoint's prefix cache keeps serving it. It carries the recovery guidance: the
+session's transcript path and command-log directory, and the instruction to search both
+with `rg` to pick the earlier work back up. The full records stay on disk — the
+transcript holds every message and the per-command log files hold every output — so
+nothing is lost to the reset.
 
 ### Unattended-run bounds
 
@@ -241,6 +272,16 @@ Override precedence is **CLI flag > environment variable > YAML default**:
 
 your-model returns its chain-of-thought in a separate `reasoning_content` field. We use
 **only** the main message `content` for action parsing and ignore `reasoning_content`.
+
+A call carries no `max_tokens`: the model runs to its context limit and stops on its
+own, and a reply that stops there reports `finish_reason: length`, which ends the run
+(see How a run ends).
+
+Some endpoints stream parallel tool calls as fragments that all carry index 0 and ignore
+`parallel_tool_calls=false`; Gemini's OpenAI-compatible endpoint does both.
+`separate_tool_call_fragments` in `src/model.py` rewrites the fragments before the
+streamed rebuild: it splits by index first and gives each distinct id its own index, so
+parallel calls are not fused into one.
 
 ## Tests
 
