@@ -328,10 +328,11 @@ def test_step_limit_kills_the_running_background_task(tmp_path, templates):
 
 
 def test_at_most_four_records_per_result(tmp_path, templates):
+    # Increasing waits make the expected exit order stable under scheduler jitter.
     agent = _agent(
         tmp_path, templates,
         assistant(tool_calls=[
-            tool_call(n, command=f"sleep 0.4; echo {n}", background=True)
+            tool_call(n, command=f"sleep {n / 10:.1f}; echo {n}", background=True)
             for n in range(1, 7)
         ]),
         assistant(tool_calls=[tool_call(1, command="sleep 0.9; echo a")]),
