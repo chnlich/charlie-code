@@ -120,84 +120,19 @@ class Transcript:
         content = message.get("content")
         if content:
             parts.append(_body(content))
-        for text in Transcript.command_texts(message):
-            parts.append(_body(f"$ {text}"))
-        return f"\n## assistant · step {step} · {_utc_now()}\n" + "".join(parts)
-
-    @staticmethod
-    def command_texts(message):
-        """The exact command or raw arguments written for each tool call."""
-        texts = []
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
             raw = function.get("arguments") or ""
-            text = None
+            command = None
             if function.get("name") == "bash":
                 try:
                     payload = json.loads(raw or "{}")
                 except json.JSONDecodeError:
                     payload = None
                 if isinstance(payload, dict) and isinstance(payload.get("command"), str):
-                    text = payload["command"]
-            texts.append(text if text is not None else raw)
-        return texts
-
-    def step_records(self):
-        """Step numbers, full commands and output stubs recorded on disk."""
-        if not self.path.exists():
-            return []
-
-        records = []
-        current = None
-
-        def finish_record():
-            if current is None:
-                return
-            stubs = current.pop("stubs")
-            tool_stubs = []
-            stub_index = 0
-            for _ in current["commands"]:
-                if stub_index == len(stubs):
-                    tool_stubs.append(None)
-                    continue
-                group = [stubs[stub_index]]
-                stub_index += 1
-                while (
-                    stub_index < len(stubs)
-                    and stubs[stub_index].startswith("-> background ")
-                    and " exit " in stubs[stub_index]
-                ):
-                    group.append(stubs[stub_index])
-                    stub_index += 1
-                tool_stubs.append("".join(group))
-            current["tool_stubs"] = tool_stubs
-            records.append(current)
-
-        reading_command = False
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("## assistant · step "):
-                finish_record()
-                current = {
-                    "step": int(line.split(" · ")[1].removeprefix("step ")),
-                    "commands": [],
-                    "stubs": [],
-                }
-                reading_command = False
-            elif line.startswith("## "):
-                finish_record()
-                current = None
-                reading_command = False
-            elif current is not None:
-                if line.startswith("$ "):
-                    current["commands"].append(line[2:])
-                    reading_command = True
-                elif line.startswith("-> ") and current["commands"]:
-                    current["stubs"].append(line + "\n")
-                    reading_command = False
-                elif reading_command:
-                    current["commands"][-1] += "\n" + line
-        finish_record()
-        return records
+                    command = payload["command"]
+            parts.append(_body(f"$ {command if command is not None else raw}"))
+        return f"\n## assistant · step {step} · {_utc_now()}\n" + "".join(parts)
 
     @staticmethod
     def tool_stub(returncode, output, log_path):

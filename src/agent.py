@@ -11,18 +11,18 @@ back per call. A reply that carries no tool call ends the session and is
 delivered to the user as the answer, as written. A reply with neither tool
 calls nor text is an error.
 
-Messages append during a run. After a step, old command outputs, reasoning and
-long command text can leave the context together in a batch; between batches the
-message list stays byte-identical for the endpoint's prefix cache. Each command's
-output is bounded on its own before it enters the context (see compact.py). Before
-every model call the agent estimates the context from the last measured
-prompt_tokens plus chars/4 of what was appended since; at or above
-threshold_fraction * context_window it rebuilds the context as three messages,
-the system message, a one-line pointer to the session's transcript and command log
-directory, and this turn's task. The transcript (transcript.py) keeps every full
-message and the per-command log files keep full outputs, so the model can read
-older material back with rg. An over-window error from the endpoint runs the same
-reset and retries the call once instead of killing the session.
+History is append-only: a message that has been sent is never rewritten, so the
+prompt prefix stays byte-identical from one call to the next and the endpoint's
+prefix cache keeps hitting. Each command's output is bounded on its own before it
+enters the context (see compact.py). Before every model call the agent estimates
+the context from the last measured prompt_tokens plus chars/4 of what was appended
+since; at or above threshold_fraction * context_window it rebuilds the context as
+three messages, the system message, a one-line pointer to the session's transcript
+and command log directory, and this turn's task, and the older material stays on
+disk: the transcript (transcript.py) holds every message the model saw, the
+per-command log files hold the full outputs, and the model reads them back with
+rg. An over-window error from the endpoint runs the same reset and retries the
+call once instead of killing the session.
 
 Every message enters history through `Agent._append_message`, which appends the
 transcript record and then rewrites the session state file atomically: a process
@@ -42,14 +42,7 @@ from pathlib import Path
 import yaml
 from litellm.exceptions import ContextWindowExceededError
 
-from compact import (
-    EXPIRY_BATCH_TOKEN_THRESHOLD,
-    EXPIRY_COMMAND_PREFIX_CHARS,
-    EXPIRY_KEEP_STEPS,
-    command_expiry_preview,
-    est_messages_tokens,
-    truncate_observation,
-)
+from compact import est_messages_tokens, truncate_observation
 from model import strip_leaked_reasoning
 from transcript import Transcript
 
@@ -309,8 +302,6 @@ class Agent:
         self.images = list(images)
         self.instructions_file = instructions_file
         self.messages = []
-        self._expiry_steps = []
-        self._expiry_step_base = 0
         # This turn's task message: the third message of every rebuilt context.
         self._task = None
         # len(self.messages) at the last successful model query: messages after it
@@ -374,8 +365,8 @@ class Agent:
 
         The transcript record goes first, so the transcript is never behind the
         context a kill leaves on disk. Persisting on every append bounds what a
-        kill can lose to the message being produced; batch expiry later rewrites
-        only the state copy, while the transcript keeps the complete records.
+        kill at any moment can lose to the message being produced; the file on
+        disk is otherwise always the complete history so far.
         """
         self.messages.append(message)
         self._record(record)
@@ -411,189 +402,6 @@ class Agent:
                 session_dir=str(self.session_dir),
             ),
         }
-
-    @staticmethod
-    def _transcript_commands_match(recorded, stored):
-        if len(recorded) != len(stored):
-            return False
-        marker = "\n[full command in transcript step "
-        for full, current in zip(recorded, stored):
-            if full == current:
-                continue
-            if marker in current and full.startswith(current.split(marker, 1)[0]):
-                continue
-            return False
-        return True
-
-    def _loaded_expiry_steps(self):
-        """Index loaded assistant steps and their transcript output stubs."""
-        assistant_indices = [
-            index for index, message in enumerate(self.messages)
-            if message.get("role") == "assistant"
-        ]
-        transcript_records = self.transcript.step_records() if self.transcript else []
-        matched_records = {}
-        record_index = len(transcript_records) - 1
-        for message_index in reversed(assistant_indices):
-            message = self.messages[message_index]
-            commands = Transcript.command_texts(message)
-            for candidate_index in range(record_index, -1, -1):
-                candidate = transcript_records[candidate_index]
-                if self._transcript_commands_match(candidate["commands"], commands):
-                    matched_records[message_index] = candidate
-                    record_index = candidate_index - 1
-                    break
-
-        steps = []
-        for ordinal, message_index in enumerate(assistant_indices, start=1):
-            assistant = self.messages[message_index]
-            record = matched_records.get(message_index)
-            step = {
-                "ordinal": ordinal,
-                "transcript_step": record["step"] if record else None,
-                "assistant": assistant,
-                "outputs": [],
-            }
-            calls = assistant.get("tool_calls") or []
-            call_indices = {call.get("id"): index for index, call in enumerate(calls)}
-            stubs = record["tool_stubs"] if record else []
-            for tool_message in self.messages[message_index + 1:]:
-                if tool_message.get("role") != "tool":
-                    break
-                call_index = call_indices.get(tool_message.get("tool_call_id"))
-                if call_index is None:
-                    continue
-                call = calls[call_index]
-                command, _, error = tool_call_command(call)
-                content = tool_message.get("content") or ""
-                if error is not None or content == INTERRUPTED_TOOL_RESULT:
-                    continue
-                if content.startswith("[observation masked by context compaction:"):
-                    continue
-                if content.startswith(("-> exit ", "-> background · pid ")):
-                    continue
-                stub = stubs[call_index] if call_index < len(stubs) else None
-                if stub is not None and not stub.startswith(
-                    ("-> exit ", "-> background · pid ")
-                ):
-                    stub = None
-                step["outputs"].append({
-                    "message": tool_message,
-                    "replacement": stub,
-                    "prefix": None,
-                    "suffix": None,
-                })
-            steps.append(step)
-        return steps
-
-    @staticmethod
-    def _track_expiry_output(step, message, replacement):
-        if not replacement.startswith(("-> exit ", "-> background · pid ")):
-            return
-        step["outputs"].append({
-            "message": message,
-            "replacement": replacement,
-            "prefix": None,
-            "suffix": None,
-        })
-
-    @staticmethod
-    def _track_expiry_segment(step, message, prefix, replacement):
-        if prefix and replacement:
-            step["outputs"].append({
-                "message": message,
-                "replacement": replacement,
-                "prefix": prefix,
-                "suffix": message["content"][len(prefix):],
-            })
-
-    @staticmethod
-    def _command_payload(tool_call):
-        function = tool_call.get("function") or {}
-        if function.get("name") != "bash":
-            return None, None
-        try:
-            payload = json.loads(function.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            return None, None
-        if not isinstance(payload, dict) or not isinstance(payload.get("command"), str):
-            return None, None
-        return payload, payload["command"]
-
-    def _expire_old_content(self, current_step):
-        """Replace eligible old content together once its estimated size reaches the batch."""
-        if self.transcript is None:
-            return False
-
-        eligible_steps = [
-            step for step in self._expiry_steps
-            if current_step - step["ordinal"] > EXPIRY_KEEP_STEPS
-        ]
-        reasoning = []
-        commands = []
-        outputs = []
-        expirable_chars = 0
-        marker = "\n[full command in transcript step "
-        for step in eligible_steps:
-            content = step["assistant"].get("reasoning_content")
-            if content:
-                reasoning.append(step["assistant"])
-                expirable_chars += len(content)
-            for call in step["assistant"].get("tool_calls") or []:
-                payload, command = self._command_payload(call)
-                if (
-                    command is not None
-                    and len(command) > EXPIRY_COMMAND_PREFIX_CHARS
-                    and marker not in command
-                ):
-                    commands.append((step, call, payload, command))
-                    expirable_chars += len(command)
-            for output in step["outputs"]:
-                message = output["message"]
-                replacement = output["replacement"]
-                content = message.get("content") or ""
-                prefix = output["prefix"]
-                if prefix is None:
-                    if replacement is not None and content == replacement:
-                        continue
-                    size = len(content)
-                else:
-                    suffix = output["suffix"]
-                    if replacement is not None and content == replacement + suffix:
-                        continue
-                    size = len(prefix)
-                outputs.append(output)
-                expirable_chars += size
-
-        if expirable_chars // 4 < EXPIRY_BATCH_TOKEN_THRESHOLD:
-            return False
-
-        for step, _, _, _ in commands:
-            if step["transcript_step"] is None:
-                raise RuntimeError(
-                    "cannot expire a long command without its transcript step"
-                )
-        for output in outputs:
-            if output["replacement"] is None:
-                raise RuntimeError(
-                    "cannot expire command output without its transcript stub"
-                )
-
-        for message in reasoning:
-            del message["reasoning_content"]
-        for step, tool_call, payload, command in commands:
-            payload["command"] = command_expiry_preview(
-                command, step["transcript_step"], self.transcript.path
-            )
-            tool_call["function"]["arguments"] = json.dumps(payload)
-        for output in outputs:
-            message = output["message"]
-            if output["prefix"] is None:
-                message["content"] = output["replacement"]
-            else:
-                message["content"] = output["replacement"] + output["suffix"]
-        self._persist_messages()
-        return True
 
     def _collect_deliveries(self):
         """Exited background tasks' records for the result being assembled.
@@ -653,7 +461,7 @@ class Agent:
         return ("background tasks " + ", ".join(items[:-1]) + " and " + items[-1]
                 + " are still running")
 
-    def _run_tool_calls(self, step_idx, thought, tool_calls, expiry_step):
+    def _run_tool_calls(self, step_idx, thought, tool_calls):
         """Run every call in order, appending one tool message per call.
 
         Every observation passes the control-marker gate on its complete output
@@ -699,13 +507,10 @@ class Agent:
                     self.emit({"type": "observation", "step": step_idx,
                                "id": event_id, "returncode": None,
                                "background": True, "output": content})
-                record = Transcript.background_start_stub(task.pid, task.log_path) + stubs
-                tool_message = {
-                    "role": "tool", "tool_call_id": tool_call.get("id"),
-                    "content": content,
-                }
-                self._append_message(tool_message, record=record)
-                self._track_expiry_output(expiry_step, tool_message, record)
+                self._append_message(
+                    {"role": "tool", "tool_call_id": tool_call.get("id"), "content": content},
+                    record=Transcript.background_start_stub(task.pid, task.log_path) + stubs,
+                )
                 records.append({"thought": step_thought, "command": command,
                                 "observation": content, "returncode": None,
                                 "note": "background"})
@@ -727,15 +532,11 @@ class Agent:
                 self.emit({"type": "observation", "step": step_idx,
                            "id": event_id, "returncode": result["returncode"],
                            "output": output + ("\n\n" + text if text else "")})
-            record = Transcript.tool_stub(
-                result["returncode"], result["output"], result["log_path"]
-            ) + stubs
-            tool_message = {
-                "role": "tool", "tool_call_id": tool_call.get("id"),
-                "content": observation,
-            }
-            self._append_message(tool_message, record=record)
-            self._track_expiry_output(expiry_step, tool_message, record)
+            self._append_message(
+                {"role": "tool", "tool_call_id": tool_call.get("id"), "content": observation},
+                record=Transcript.tool_stub(result["returncode"], result["output"],
+                                            result["log_path"]) + stubs,
+            )
             records.append({"thought": step_thought, "command": command,
                             "observation": observation,
                             "returncode": result["returncode"], "note": note})
@@ -791,7 +592,6 @@ class Agent:
         there. The anchor is cleared so the next query re-measures.
         """
         self.messages = [self.messages[0], self._pointer_message(), self._task]
-        self._expiry_steps = []
         self._persist_messages()
         post_tokens_est = est_messages_tokens(self.messages)
         self._record(Transcript.reset_record(trigger, int(pre_tokens), post_tokens_est))
@@ -860,17 +660,12 @@ class Agent:
 
     def run(self, task):
         self.messages = self._initial_messages()
-        self._expiry_steps = self._loaded_expiry_steps()
-        self._expiry_step_base = len(self._expiry_steps)
-        if self._expiry_step_base:
-            self._expire_old_content(self._expiry_step_base)
         self._task = self._task_message(task)
         self._append_message(self._task, record=Transcript.user_record(self._task))
         self._check_reset_floor()
         steps = []
         try:
             for step_idx in range(1, self.step_limit + 1):
-                step_ordinal = self._expiry_step_base + step_idx
                 self._maybe_reset(step_idx)
                 message, finish_reason = self._query_step(step_idx)
                 if self.emit:
@@ -886,19 +681,11 @@ class Agent:
                 self._append_message(
                     message, record=Transcript.assistant_record(message, step_idx)
                 )
-                expiry_step = {
-                    "ordinal": step_ordinal,
-                    "transcript_step": step_idx,
-                    "assistant": message,
-                    "outputs": [],
-                }
-                self._expiry_steps.append(expiry_step)
                 reply = strip_leaked_reasoning(message.get("content") or "").strip()
                 if self.emit and reply:
                     self.emit({"type": "thought", "step": step_idx, "text": reply})
 
                 if finish_reason == "length":
-                    self._expire_old_content(step_ordinal)
                     raise RuntimeError(
                         f"Step {step_idx}: generation was truncated "
                         "(finish_reason=length); raise the endpoint's output budget."
@@ -906,20 +693,15 @@ class Agent:
 
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
-                    steps.extend(self._run_tool_calls(
-                        step_idx, reply, tool_calls, expiry_step
-                    ))
-                    self._expire_old_content(step_ordinal)
+                    steps.extend(self._run_tool_calls(step_idx, reply, tool_calls))
                     continue
 
                 if finish_reason != "stop":
-                    self._expire_old_content(step_ordinal)
                     raise RuntimeError(
                         f"Step {step_idx}: unexpected finish_reason={finish_reason!r}."
                     )
 
                 if not reply:
-                    self._expire_old_content(step_ordinal)
                     raise RuntimeError(f"Step {step_idx}: empty reply with no "
                                        "tool call; nothing to deliver.")
 
@@ -939,13 +721,10 @@ class Agent:
                     self._append_message(
                         reminder, record=Transcript.user_record(reminder) + stubs
                     )
-                    self._track_expiry_segment(expiry_step, reminder, text, stubs)
-                    self._expire_old_content(step_ordinal)
                     steps.append({"thought": reply, "command": None,
                                   "observation": content, "note": "background pending"})
                     continue
 
-                self._expire_old_content(step_ordinal)
                 return {"task": task, "steps": steps, "completed": True,
                         "n_steps": step_idx, "final_output": reply,
                         "usage": self.model.usage()}

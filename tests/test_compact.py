@@ -2,9 +2,7 @@
 over-window fallback, the startup floor, and the byte-stable prefix the whole
 design exists for."""
 
-import copy
 import json
-from pathlib import Path
 
 import litellm
 import pytest
@@ -19,7 +17,6 @@ from compact import (IMAGE_TOKENS, TRUNCATION_MARKER, est_message_chars,
 from conftest import assistant, tool_call
 from environment import Environment
 from model import Model
-from transcript import Transcript
 
 OVERFLOW = "OVERFLOW"
 BAD400 = "BAD400"
@@ -41,7 +38,7 @@ class ResetModel:
         self.seen_prompts = []
 
     def query(self, messages, tools=None):
-        self.seen_prompts.append(copy.deepcopy(messages))
+        self.seen_prompts.append([dict(message) for message in messages])
         reply, prompt_tokens = next(self._steps)
         if reply == OVERFLOW:
             raise ContextWindowExceededError(
@@ -101,21 +98,6 @@ def _marker(output):
     return TRUNCATION_MARKER.format(chars=len(output), lines=output.count("\n") + 1)
 
 
-def _expiry_compact(**overrides):
-    compact = {"context_window": 1_000_000, "threshold_fraction": 0.99,
-               "command_observation_chars": 100_000}
-    compact.update(overrides)
-    return compact
-
-
-def _call_step(index, command="printf x", **extra):
-    return assistant(tool_calls=[tool_call(index, command=command)], **extra)
-
-
-def _tool_messages(messages):
-    return [message for message in messages if message["role"] == "tool"]
-
-
 # --- the per-command cap ------------------------------------------------------
 
 def test_truncate_observation_keeps_outputs_up_to_the_cap_and_splits_larger_ones():
@@ -151,113 +133,6 @@ def test_each_command_is_bounded_on_its_own_with_the_header_intact(tmp_path):
     assert tool_messages[2]["content"] == _observation("z" * 100)
     logs = sorted((tmp_path / "logs").glob("s-1-*.log"))
     assert [len(log.read_text()) for log in logs] == [300, 300, 100]
-
-
-def test_expiry_keeps_old_content_while_its_estimate_is_under_20000_tokens(tmp_path):
-    replies = [(_call_step(1, _big_output(79_000)), 100)]
-    replies.extend((_call_step(1), 100) for _ in range(4))
-    replies.append((assistant("done"), 100))
-    model = ResetModel(*replies)
-    state_file = tmp_path / "sessions" / "abc.json"
-    state_file.parent.mkdir()
-    agent = _agent(
-        tmp_path, model, compact=_expiry_compact(), state_file=state_file
-    )
-
-    agent.run("keep the old output until the expiry batch is full")
-
-    prompts = model.seen_prompts
-    for earlier, later in zip(prompts, prompts[1:]):
-        assert later[:len(earlier)] == earlier
-    first_output = _tool_messages(agent.messages)[0]["content"]
-    assert first_output == _observation("x" * 79_000)
-
-
-def test_expiry_replaces_all_eligible_outputs_in_one_prefix_boundary(tmp_path):
-    first_calls = [tool_call(index, command=_big_output(20_000))
-                   for index in range(1, 5)]
-    replies = [(assistant(tool_calls=first_calls), 100)]
-    replies.extend((_call_step(1), 100) for _ in range(4))
-    replies.append((assistant("done"), 100))
-    model = ResetModel(*replies)
-    state_file = tmp_path / "sessions" / "abc.json"
-    state_file.parent.mkdir()
-    agent = _agent(
-        tmp_path, model,
-        compact=_expiry_compact(command_observation_chars=25_000),
-        state_file=state_file,
-    )
-
-    agent.run("replace the old outputs together")
-
-    prompts = model.seen_prompts
-    for earlier, later in zip(prompts[1:4], prompts[2:5]):
-        assert later[:len(earlier)] == earlier
-        assert all(
-            message["content"] == _observation("x" * 20_000)
-            for message in _tool_messages(earlier)[:4]
-        )
-    records = Transcript(state_file.with_suffix(".d") / "transcript.md", "abc").step_records()
-    expected_stubs = records[0]["tool_stubs"]
-    expired_outputs = _tool_messages(prompts[5])[:4]
-    assert [message["content"] for message in expired_outputs] == expected_stubs
-    for stub in expected_stubs:
-        log_path = stub.rstrip("\n").split(" · ")[-1]
-        assert Path(log_path).read_text() == "x" * 20_000
-
-
-def test_expiry_removes_reasoning_and_marks_a_long_command_with_its_transcript_step(
-    tmp_path,
-):
-    long_command = "printf x; #" + " padding" * 35
-    replies = [(_call_step(1, long_command, reasoning_content="r" * 80_000), 100)]
-    replies.extend((_call_step(1), 100) for _ in range(4))
-    replies.append((assistant("done"), 100))
-    model = ResetModel(*replies)
-    state_file = tmp_path / "sessions" / "abc.json"
-    state_file.parent.mkdir()
-    agent = _agent(tmp_path, model, compact=_expiry_compact(), state_file=state_file)
-
-    agent.run("expire reasoning and keep a command pointer")
-
-    first_assistant = next(
-        message for message in agent.messages
-        if message.get("role") == "assistant" and message.get("tool_calls")
-    )
-    assert "reasoning_content" not in first_assistant
-    command = json.loads(first_assistant["tool_calls"][0]["function"]["arguments"])["command"]
-    transcript_path = state_file.with_suffix(".d") / "transcript.md"
-    marker = f"\n[full command in transcript step 1 at {transcript_path}]"
-    assert command == long_command[:200] + marker
-    assert command.count("[full command in transcript step") == 1
-    assert long_command in transcript_path.read_text()
-    assert "r" * 80_000 in transcript_path.read_text()
-
-
-def test_a_resumed_run_expires_loaded_output_by_the_same_step_and_batch_rules(tmp_path):
-    state_file = tmp_path / "sessions" / "abc.json"
-    state_file.parent.mkdir()
-    first_replies = [(_call_step(1, _big_output(80_000)), 100)]
-    first_replies.extend((_call_step(1), 100) for _ in range(3))
-    first = _agent(
-        tmp_path, ResetModel(*first_replies),
-        compact=_expiry_compact(command_observation_chars=90_000),
-        state_file=state_file, step_limit=4,
-    )
-    with pytest.raises(RuntimeError, match="Step limit"):
-        first.run("build four prior steps")
-    assert _tool_messages(first.messages)[0]["content"] == _observation("x" * 80_000)
-
-    resumed_model = ResetModel((assistant("continued"), 100))
-    resumed = _agent(
-        tmp_path, resumed_model,
-        compact=_expiry_compact(command_observation_chars=90_000),
-        state_file=state_file, resume=True,
-    )
-    resumed.run("continue the session")
-
-    records = Transcript(state_file.with_suffix(".d") / "transcript.md", "abc").step_records()
-    assert _tool_messages(resumed.messages)[0]["content"] == records[0]["tool_stubs"][0]
 
 
 def test_invalid_tool_call_error_is_bounded_by_the_same_cap(tmp_path):

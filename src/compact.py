@@ -1,11 +1,17 @@
-"""Context estimates and bounded content for the agent's message history.
+"""Context-reset helpers: the token estimate, the per-command observation cap,
+and the truncation marker. Pure functions over messages, used by agent.Agent.
 
-Token estimates use chars // 4. Before each model call, the agent adds that
-estimate for messages appended since the last measured prompt, or estimates the
-whole context when no measurement anchors it. Old step content leaves the
-context in batches; the transcript and command logs keep the full records.
-Between batches, the message list stays byte-identical for the endpoint cache.
-At the reset threshold, the agent rebuilds the context as [system, pointer, task].
+The conversation is append-only. Nothing here rewrites a message that has been
+sent, so the prompt prefix stays byte-identical from one call to the next and
+the endpoint's prefix cache keeps hitting. When the estimate reaches the
+threshold line, the agent rebuilds the context as [system, pointer, task] and
+the older material stays on disk: the transcript holds every message the model
+saw, the per-command log files hold the full outputs, and the model reads them
+back with rg.
+
+Token estimates use chars // 4. The agent anchors the trigger on the endpoint's
+measured usage.prompt_tokens when one exists and adds chars // 4 of what was
+appended since; without an anchor it estimates the whole context.
 """
 
 import json
@@ -13,15 +19,6 @@ import json
 #: Tokens charged per image part in an estimate. The base64 length of an image
 #: says nothing about its token count, so every image counts as this constant.
 IMAGE_TOKENS = 1600
-
-# Three recent steps stay available for follow-up work on the current task.
-EXPIRY_KEEP_STEPS = 3
-
-# A batch waits for enough old content to amortize one prefix-cache invalidation.
-EXPIRY_BATCH_TOKEN_THRESHOLD = 20_000
-
-# Long commands keep a readable prefix while the transcript remains authoritative.
-EXPIRY_COMMAND_PREFIX_CHARS = 200
 
 #: The one line that replaces the middle of an over-cap command output. It
 #: states the totals of the full output and names no file: the transcript's stub
@@ -79,13 +76,3 @@ def truncate_observation(output, cap):
     tail = cap - head
     marker = TRUNCATION_MARKER.format(chars=len(output), lines=line_count(output))
     return output[:head] + "\n" + marker + "\n" + output[len(output) - tail:]
-
-
-def command_expiry_preview(command, transcript_step, transcript_path):
-    """Keep a long command's prefix and point to its full transcript record."""
-    if len(command) <= EXPIRY_COMMAND_PREFIX_CHARS:
-        return command
-    marker = (
-        f"\n[full command in transcript step {transcript_step} at {transcript_path}]"
-    )
-    return command[:EXPIRY_COMMAND_PREFIX_CHARS] + marker
