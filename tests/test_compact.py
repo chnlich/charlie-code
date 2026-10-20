@@ -12,6 +12,7 @@ import typer
 from litellm.exceptions import ContextWindowExceededError
 from typer.testing import CliRunner
 
+import agent as agent_module
 import main as cli_main
 from agent import STATE_PROTOCOL, Agent, _load_state, load_config, render
 from compact import (IMAGE_TOKENS, TRUNCATION_MARKER, est_message_chars,
@@ -258,6 +259,80 @@ def test_a_resumed_run_expires_loaded_output_by_the_same_step_and_batch_rules(tm
 
     records = Transcript(state_file.with_suffix(".d") / "transcript.md", "abc").step_records()
     assert _tool_messages(resumed.messages)[0]["content"] == records[0]["tool_stubs"][0]
+
+
+HEREDOC_WITH_HEADINGS = (
+    "cat > notes.md <<'EOF'\n"
+    "# Plan\n"
+    "## Step one\n"
+    + "Padding line for the record.\n" * 8
+    + "```python\nprint('two')\n```\n"
+    "EOF"
+)
+
+
+def test_a_resumed_session_expires_over_the_batch_with_one_record_per_step(
+    tmp_path, monkeypatch
+):
+    state_file = tmp_path / "sessions" / "abc.json"
+    state_file.parent.mkdir()
+    transcript_path = state_file.with_suffix(".d") / "transcript.md"
+    replies = [(_call_step(1, HEREDOC_WITH_HEADINGS), 100)]
+    replies.extend((_call_step(1, _big_output(17_000)), 100) for _ in range(9))
+    first = _agent(tmp_path, ResetModel(*replies), compact=_expiry_compact(),
+                   state_file=state_file, step_limit=10)
+    # The first run keeps its whole batch on disk, so the expiry happens on resume.
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_module, "EXPIRY_BATCH_TOKEN_THRESHOLD", 10**9)
+        with pytest.raises(RuntimeError, match="Step limit"):
+            first.run("ten steps")
+    messages = _load_state(state_file)
+    unmatched = {"role": "assistant", "content": "", "reasoning_content": "r" * 5_000,
+                 "tool_calls": [tool_call(99, command="printf unrecorded")]}
+    unmatched_tool = {"role": "tool", "tool_call_id": "call-99",
+                      "content": _observation("u" * 16_000)}
+    messages[2:2] = [unmatched, unmatched_tool]
+    state_file.write_text(json.dumps({"protocol": STATE_PROTOCOL, "messages": messages}))
+    before = copy.deepcopy([unmatched, unmatched_tool])
+
+    resumed = _agent(tmp_path, ResetModel((assistant("done"), 100)),
+                     compact=_expiry_compact(), state_file=state_file, resume=True)
+    result = resumed.run("continue")
+
+    assert result["completed"] is True
+    records = Transcript(transcript_path, "abc").step_records()
+    assert [record["step"] for record in records] == list(range(1, 12))
+    by_step = {record["step"]: record for record in records}
+    assert by_step[1]["commands"] == [HEREDOC_WITH_HEADINGS]
+    heredoc_call = resumed.messages[4]["tool_calls"][0]
+    assert json.loads(heredoc_call["function"]["arguments"])["command"] == (
+        HEREDOC_WITH_HEADINGS[:200] + f"\n[full command in transcript step 1 at {transcript_path}]")
+    # Tool message 0 is the unmatched step; message k is run step k's output.
+    tool_messages = _tool_messages(resumed.messages)
+    for step in range(1, 7):
+        assert tool_messages[step]["content"] == by_step[step]["tool_stubs"][0]
+    for step in range(7, 11):
+        assert tool_messages[step]["content"] == _observation("x" * 17_000)
+    assert resumed.messages[2:4] == before
+    assert transcript_path.read_text(encoding="utf-8").count("\n## expiry · ") == 1
+
+
+def test_a_session_without_a_state_file_expires_nothing_over_the_batch(tmp_path):
+    long_command = "printf x; #" + " padding" * 35
+    replies = [(_call_step(1, _big_output(80_000), reasoning_content="r" * 80_000), 100),
+               (_call_step(1, long_command), 100)]
+    replies.extend((_call_step(1), 100) for _ in range(3))
+    replies.append((assistant("done"), 100))
+    agent = _agent(tmp_path, ResetModel(*replies), compact=_expiry_compact())
+
+    result = agent.run("expire nothing without a transcript")
+
+    assert result["completed"] is True
+    assert agent.transcript is None
+    first, second = [m for m in agent.messages if m.get("tool_calls")][:2]
+    assert first["reasoning_content"] == "r" * 80_000
+    assert _tool_messages(agent.messages)[0]["content"] == _observation("x" * 80_000)
+    assert json.loads(second["tool_calls"][0]["function"]["arguments"])["command"] == long_command
 
 
 def test_invalid_tool_call_error_is_bounded_by_the_same_cap(tmp_path):

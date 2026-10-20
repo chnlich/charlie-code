@@ -47,6 +47,7 @@ from compact import (
     EXPIRY_COMMAND_PREFIX_CHARS,
     EXPIRY_KEEP_STEPS,
     command_expiry_preview,
+    est_message_chars,
     est_messages_tokens,
     truncate_observation,
 )
@@ -311,6 +312,12 @@ class Agent:
         self.messages = []
         self._expiry_steps = []
         self._expiry_step_base = 0
+        # Transcript step numbers continue from the last one on disk, so a pointer
+        # names exactly one record; step_idx itself restarts at 1 every run.
+        self._transcript_step_base = 0
+        # Set once per run, when old content kept for lack of a transcript step
+        # reaches the batch size: the transcript then notes it.
+        self._unmatched_note_written = False
         # This turn's task message: the third message of every rebuilt context.
         self._task = None
         # len(self.messages) at the last successful model query: messages after it
@@ -413,25 +420,27 @@ class Agent:
         }
 
     @staticmethod
-    def _transcript_commands_match(recorded, stored):
+    def _transcript_commands_match(record, stored):
+        """Whether a stored step's commands are the record's commands. A long command
+        may carry a pointer, which must name the record's own step."""
+        recorded = record["commands"]
         if len(recorded) != len(stored):
             return False
-        marker = "\n[full command in transcript step "
+        marker = f"\n[full command in transcript step {record['step']} at "
         for full, current in zip(recorded, stored):
-            if full == current:
+            if full.rstrip("\n") == current.rstrip("\n"):
                 continue
             if marker in current and full.startswith(current.split(marker, 1)[0]):
                 continue
             return False
         return True
 
-    def _loaded_expiry_steps(self):
+    def _loaded_expiry_steps(self, transcript_records):
         """Index loaded assistant steps and their transcript output stubs."""
         assistant_indices = [
             index for index, message in enumerate(self.messages)
             if message.get("role") == "assistant"
         ]
-        transcript_records = self.transcript.step_records() if self.transcript else []
         matched_records = {}
         record_index = len(transcript_records) - 1
         for message_index in reversed(assistant_indices):
@@ -439,7 +448,7 @@ class Agent:
             commands = Transcript.command_texts(message)
             for candidate_index in range(record_index, -1, -1):
                 candidate = transcript_records[candidate_index]
-                if self._transcript_commands_match(candidate["commands"], commands):
+                if self._transcript_commands_match(candidate, commands):
                     matched_records[message_index] = candidate
                     record_index = candidate_index - 1
                     break
@@ -521,7 +530,13 @@ class Agent:
         return payload, payload["command"]
 
     def _expire_old_content(self, current_step):
-        """Replace eligible old content together once its estimated size reaches the batch."""
+        """Replace eligible old content together once its estimated size reaches the batch.
+
+        A step with no matching transcript record keeps its content: it neither
+        expires nor counts toward the batch. An output with no transcript stub
+        stays too. Once per run, when the eligible content reaches the batch size
+        with some of it kept that way, the transcript gets one `## expiry` note.
+        """
         if self.transcript is None:
             return False
 
@@ -533,8 +548,17 @@ class Agent:
         commands = []
         outputs = []
         expirable_chars = 0
+        kept_steps = 0
+        kept_chars = 0
         marker = "\n[full command in transcript step "
         for step in eligible_steps:
+            if step["transcript_step"] is None:
+                kept_steps += 1
+                kept_chars += est_message_chars(step["assistant"])
+                kept_chars += sum(
+                    est_message_chars(output["message"]) for output in step["outputs"]
+                )
+                continue
             content = step["assistant"].get("reasoning_content")
             if content:
                 reasoning.append(step["assistant"])
@@ -549,35 +573,34 @@ class Agent:
                     commands.append((step, call, payload, command))
                     expirable_chars += len(command)
             for output in step["outputs"]:
-                message = output["message"]
                 replacement = output["replacement"]
+                if replacement is None:
+                    continue
+                message = output["message"]
                 content = message.get("content") or ""
                 prefix = output["prefix"]
                 if prefix is None:
-                    if replacement is not None and content == replacement:
+                    if content == replacement:
                         continue
                     size = len(content)
                 else:
                     suffix = output["suffix"]
-                    if replacement is not None and content == replacement + suffix:
+                    if content == replacement + suffix:
                         continue
                     size = len(prefix)
                 outputs.append(output)
                 expirable_chars += size
 
+        if (
+            kept_chars
+            and not self._unmatched_note_written
+            and (expirable_chars + kept_chars) // 4 >= EXPIRY_BATCH_TOKEN_THRESHOLD
+        ):
+            self._record(Transcript.expiry_record(kept_steps))
+            self._unmatched_note_written = True
+
         if expirable_chars // 4 < EXPIRY_BATCH_TOKEN_THRESHOLD:
             return False
-
-        for step, _, _, _ in commands:
-            if step["transcript_step"] is None:
-                raise RuntimeError(
-                    "cannot expire a long command without its transcript step"
-                )
-        for output in outputs:
-            if output["replacement"] is None:
-                raise RuntimeError(
-                    "cannot expire command output without its transcript stub"
-                )
 
         for message in reasoning:
             del message["reasoning_content"]
@@ -860,7 +883,11 @@ class Agent:
 
     def run(self, task):
         self.messages = self._initial_messages()
-        self._expiry_steps = self._loaded_expiry_steps()
+        transcript_records = self.transcript.step_records() if self.transcript else []
+        self._transcript_step_base = max(
+            (record["step"] for record in transcript_records), default=0
+        )
+        self._expiry_steps = self._loaded_expiry_steps(transcript_records)
         self._expiry_step_base = len(self._expiry_steps)
         if self._expiry_step_base:
             self._expire_old_content(self._expiry_step_base)
@@ -871,6 +898,7 @@ class Agent:
         try:
             for step_idx in range(1, self.step_limit + 1):
                 step_ordinal = self._expiry_step_base + step_idx
+                transcript_step = self._transcript_step_base + step_idx
                 self._maybe_reset(step_idx)
                 message, finish_reason = self._query_step(step_idx)
                 if self.emit:
@@ -884,11 +912,11 @@ class Agent:
                         "model": self.model.model_name,
                     })
                 self._append_message(
-                    message, record=Transcript.assistant_record(message, step_idx)
+                    message, record=Transcript.assistant_record(message, transcript_step)
                 )
                 expiry_step = {
                     "ordinal": step_ordinal,
-                    "transcript_step": step_idx,
+                    "transcript_step": transcript_step,
                     "assistant": message,
                     "outputs": [],
                 }

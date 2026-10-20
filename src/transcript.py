@@ -17,23 +17,44 @@ have no header and no blank line, so they attach to the assistant record above.
     ## user · <UTC time>
     <message text verbatim>
 
-    ## assistant · step <n> · <UTC time>
+    ## assistant · step <n> · v2 · <UTC time>
+    ```text
     <reasoning, when the endpoint returned any>
+    ```
+    ```text
     <reply text>
+    ```
+    ```
     $ <command>
+    ```
     -> exit <code> · <chars> chars · <lines> lines · <log file>
     -> background · pid <pid> · <log file>
     -> background <task id> exit <code> · <chars> chars · <lines> lines · <log file>
 
     ## reset · <UTC time> · <trigger> · pre <n> tokens · post <n> tokens
+
+    ## expiry · <UTC time> · kept <n> steps without a matching transcript step
+
+A v2 assistant record fences each reasoning, reply and command body in backticks
+longer than any backtick run that opens a line of that body, so no line inside a
+fence is record structure. Reasoning and reply carry the info string `text`; a
+command block has none and its first line is `$ `. An assistant header without
+the `v2` token is a legacy record: read by line rules alone, where a `$ ` line
+opens a command and any `## ` line ends the record.
 """
 
 import base64
 import datetime
 import json
+import re
 from pathlib import Path
 
 from compact import line_count
+
+ASSISTANT_HEADER = "## assistant · step "
+
+# An opening fence of a v2 block: backticks, then `text` for reasoning and reply.
+FENCE_OPEN = re.compile(r"(`{3,})(text)?")
 
 PREAMBLE = (
     "# charlie-code transcript · session {session_id}\n"
@@ -50,6 +71,14 @@ def _utc_now():
 def _body(text):
     """A record body: the text verbatim, closed by exactly one newline."""
     return text.rstrip("\n") + "\n"
+
+
+def _fenced(body, info=""):
+    """`body` in a backtick fence of at least three backticks, longer than any
+    backtick run that opens a line of `body`: no line of the body can close it."""
+    longest = max((len(run) for run in re.findall(r"^`+", body, re.MULTILINE)), default=0)
+    ticks = "`" * max(3, longest + 1)
+    return f"{ticks}{info}\n{body}\n{ticks}\n"
 
 
 def _image_bytes(url):
@@ -112,17 +141,18 @@ class Transcript:
     @staticmethod
     def assistant_record(message, step):
         """An assistant message: reasoning (when present), the reply text, and
-        one `$` block per tool call. An invalid call shows its raw arguments."""
+        one command block per tool call. An invalid call shows its raw arguments.
+        Every body is fenced, so step_records reads it back verbatim."""
         parts = []
         reasoning = message.get("reasoning_content")
         if reasoning:
-            parts.append(_body(reasoning))
+            parts.append(_fenced(reasoning.rstrip("\n"), "text"))
         content = message.get("content")
         if content:
-            parts.append(_body(content))
+            parts.append(_fenced(content.rstrip("\n"), "text"))
         for text in Transcript.command_texts(message):
-            parts.append(_body(f"$ {text}"))
-        return f"\n## assistant · step {step} · {_utc_now()}\n" + "".join(parts)
+            parts.append(_fenced("$ " + text.rstrip("\n")))
+        return f"\n## assistant · step {step} · v2 · {_utc_now()}\n" + "".join(parts)
 
     @staticmethod
     def command_texts(message):
@@ -143,7 +173,12 @@ class Transcript:
         return texts
 
     def step_records(self):
-        """Step numbers, full commands and output stubs recorded on disk."""
+        """Step numbers, full commands and output stubs recorded on disk.
+
+        Lines split on "\\n" alone and keep every other byte, so a command
+        carrying \\x0c or \\r reads back as written. An assistant header whose
+        step is not an integer drops that record. Nothing here raises.
+        """
         if not self.path.exists():
             return []
 
@@ -173,29 +208,52 @@ class Transcript:
             current["tool_stubs"] = tool_stubs
             records.append(current)
 
+        with self.path.open(encoding="utf-8", newline="") as handle:
+            lines = handle.read().split("\n")
+        if lines[-1] == "":
+            lines.pop()
+
+        fenced = False
         reading_command = False
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("## assistant · step "):
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            index += 1
+            if line.startswith(ASSISTANT_HEADER):
                 finish_record()
-                current = {
-                    "step": int(line.split(" · ")[1].removeprefix("step ")),
-                    "commands": [],
-                    "stubs": [],
-                }
+                fields = line[len(ASSISTANT_HEADER):].split(" · ")
+                current = None
+                if fields[0].isdecimal():
+                    current = {"step": int(fields[0]), "commands": [], "stubs": []}
+                fenced = fields[1:2] == ["v2"]
                 reading_command = False
             elif line.startswith("## "):
                 finish_record()
                 current = None
                 reading_command = False
-            elif current is not None:
-                if line.startswith("$ "):
-                    current["commands"].append(line[2:])
-                    reading_command = True
+            elif current is None:
+                continue
+            elif fenced:
+                opener = FENCE_OPEN.fullmatch(line)
+                if opener is not None:
+                    ticks = opener.group(1)
+                    end = index
+                    while end < len(lines) and lines[end] != ticks:
+                        end += 1
+                    body = "\n".join(lines[index:end])
+                    index = end + 1
+                    if opener.group(2) is None and body.startswith("$ "):
+                        current["commands"].append(body[2:])
                 elif line.startswith("-> ") and current["commands"]:
                     current["stubs"].append(line + "\n")
-                    reading_command = False
-                elif reading_command:
-                    current["commands"][-1] += "\n" + line
+            elif line.startswith("$ "):
+                current["commands"].append(line[2:])
+                reading_command = True
+            elif line.startswith("-> ") and current["commands"]:
+                current["stubs"].append(line + "\n")
+                reading_command = False
+            elif reading_command:
+                current["commands"][-1] += "\n" + line
         finish_record()
         return records
 
@@ -240,4 +298,12 @@ class Transcript:
         return (
             f"\n## reset · {_utc_now()} · {trigger} · pre {pre_tokens:,} tokens"
             f" · post {post_tokens:,} tokens\n"
+        )
+
+    @staticmethod
+    def expiry_record(kept_steps):
+        """Old content kept because its steps have no matching transcript record."""
+        return (
+            f"\n## expiry · {_utc_now()} · kept {kept_steps} steps"
+            " without a matching transcript step\n"
         )

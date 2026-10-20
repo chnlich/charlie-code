@@ -5,6 +5,7 @@ resumes."""
 import json
 from pathlib import Path
 
+import pytest
 from litellm.exceptions import ContextWindowExceededError
 
 import transcript as transcript_module
@@ -15,6 +16,10 @@ from transcript import PREAMBLE, Transcript
 
 OVERFLOW = "OVERFLOW"
 FIXED_TIME = "2026-01-01T00:00:00Z"
+# The eight commands of a real failing session, sanitized to their line shapes.
+REAL_COMMANDS = json.loads(
+    (Path(__file__).parent / "fixtures" / "clc_heredoc_commands_sanitized.json").read_text(
+        encoding="utf-8"))
 
 
 class _Model:
@@ -35,14 +40,15 @@ class _Model:
         return {"n_calls": 1, "input_tokens": 2, "output_tokens": 3}
 
 
-def _agent(tmp_path, model, state_file, resume=False):
+def _agent(tmp_path, model, state_file, resume=False, step_limit=6, emit=None):
     (tmp_path / "logs").mkdir(exist_ok=True)
     return Agent(
         model=model,
         environment=Environment(cwd=str(tmp_path), progress_notices_seconds=[],
                                 kill_after_seconds=10, log_dir=str(tmp_path / "logs")),
         templates=load_config()["templates"],
-        step_limit=6,
+        step_limit=step_limit,
+        emit=emit,
         compact={"context_window": 10000, "threshold_fraction": 0.5,
                  "command_observation_chars": 5000},
         state_file=str(state_file) if state_file else None,
@@ -81,9 +87,13 @@ def test_record_shapes(monkeypatch):
     message = {"role": "assistant", "content": "looking", "reasoning_content": "think",
                "tool_calls": [tool_call(1, command="ls -la"), tool_call(2, name="nope", x=1)]}
     assert Transcript.assistant_record(message, 3) == (
-        f"\n## assistant · step 3 · {FIXED_TIME}\nthink\nlooking\n$ ls -la\n$ {{\"x\": 1}}\n")
+        f"\n## assistant · step 3 · v2 · {FIXED_TIME}\n"
+        "```text\nthink\n```\n"
+        "```text\nlooking\n```\n"
+        "```\n$ ls -la\n```\n"
+        "```\n$ {\"x\": 1}\n```\n")
     assert Transcript.assistant_record({"role": "assistant", "content": ""}, 4) == (
-        f"\n## assistant · step 4 · {FIXED_TIME}\n")
+        f"\n## assistant · step 4 · v2 · {FIXED_TIME}\n")
 
     assert Transcript.tool_stub(0, "x" * 12345, "/logs/s-1-1.log") == (
         "-> exit 0 · 12,345 chars · 1 lines · /logs/s-1-1.log\n")
@@ -109,6 +119,123 @@ def test_append_creates_the_file_with_the_preamble_once(tmp_path):
     assert path.read_text().splitlines()[0] == "# charlie-code transcript · session abc"
 
 
+# --- reading records back ----------------------------------------------------------
+
+FORM_FEED_VARIANT = REAL_COMMANDS[0].replace("\n", "\x0c\n", 1)
+
+# Written by the 63b5376 writer: unfenced, so each record reads by the line rules.
+# The `## Step one` line inside step 1's heredoc ends that record, as it always did.
+LEGACY_TRANSCRIPT = """\
+# charlie-code transcript · session abc
+# One record per message the model saw, appended as it entered the context; the system message
+# is not recorded. "$ " opens a command; "-> " is its result: exit code, output size, and the
+# log file holding the full output. Command outputs live only in those log files.
+
+## user · 2026-01-01T00:00:00Z
+do it
+
+## assistant · step 1 · 2026-01-01T00:00:01Z
+think
+looking
+$ cat > notes.md <<'EOF'
+# Plan
+## Step one
+EOF
+-> exit 0 · 33 chars · 6 lines · /logs/s-1-1.log
+$ sleep 9 &
+-> background · pid 42 · /logs/s-1-2.log
+
+## user · 2026-01-01T00:00:02Z
+reminder
+-> background s-1-2 exit 0 · 3 chars · 1 lines · /logs/s-1-2.log
+
+## assistant · step 2 · 2026-01-01T00:00:03Z
+$ ls
+-> interrupted
+$ bad
+-> invalid call · Error: no such tool.
+
+## assistant · step 3 · 2026-01-01T00:00:04Z
+done
+
+## assistant · step 4 · 2026-01-01T00:00:05Z
+$ python3 - <<'EOF'
+print(1)
+
+print(2)
+EOF
+-> exit 0 · 4 chars · 2 lines · /logs/s-4-1.log
+$ tail -n 2 notes.md
+-> exit 0 · 3 chars · 1 lines · /logs/s-4-2.log
+
+## reset · 2026-01-01T00:00:06Z · threshold · pre 5,000 tokens · post 700 tokens
+"""
+
+
+@pytest.mark.parametrize(
+    "command",
+    REAL_COMMANDS + [FORM_FEED_VARIANT],
+    ids=[f"cmd-{number}" for number in range(1, len(REAL_COMMANDS) + 1)] + ["cmd-1-form-feed"],
+)
+def test_a_heredoc_command_reads_back_whole_from_its_record(tmp_path, command):
+    stub = Transcript.tool_stub(0, "ok\n", "/logs/s-1-1.log")
+    message = {"role": "assistant", "content": "",
+               "tool_calls": [tool_call(1, command=command)]}
+    writer = Transcript(tmp_path / "transcript.md", "abc")
+    writer.append(Transcript.assistant_record(message, 1) + stub)
+
+    (record,) = writer.step_records()
+
+    assert record["commands"] == [command.rstrip("\n")]
+    assert record["tool_stubs"] == [stub]
+
+
+def test_fenced_bodies_hold_their_own_structure_lines(tmp_path):
+    stub = Transcript.tool_stub(0, "ok\n", "/logs/s-1-1.log")
+    message = {
+        "role": "assistant",
+        "content": "$ not a command\n## not a header\n-> not a stub",
+        "reasoning_content": "```\n````\nthink",
+        "tool_calls": [tool_call(1, command="cat <<'EOF'\n```\n## x\nEOF")],
+    }
+    writer = Transcript(tmp_path / "transcript.md", "abc")
+    writer.append(Transcript.assistant_record(message, 1) + stub)
+
+    assert writer.step_records() == [{
+        "step": 1, "commands": ["cat <<'EOF'\n```\n## x\nEOF"], "tool_stubs": [stub]}]
+
+
+def test_legacy_records_read_exactly_as_the_line_rules_read_them(tmp_path):
+    path = tmp_path / "transcript.md"
+    path.write_text(LEGACY_TRANSCRIPT, encoding="utf-8")
+
+    assert Transcript(path, "abc").step_records() == [
+        {"step": 1, "commands": ["cat > notes.md <<'EOF'\n# Plan"], "tool_stubs": [None]},
+        {"step": 2, "commands": ["ls", "bad"],
+         "tool_stubs": ["-> interrupted\n", "-> invalid call · Error: no such tool.\n"]},
+        {"step": 3, "commands": [], "tool_stubs": []},
+        {"step": 4, "commands": ["python3 - <<'EOF'\nprint(1)\n\nprint(2)\nEOF",
+                                 "tail -n 2 notes.md"],
+         "tool_stubs": ["-> exit 0 · 4 chars · 2 lines · /logs/s-4-1.log\n",
+                        "-> exit 0 · 3 chars · 1 lines · /logs/s-4-2.log\n"]},
+    ]
+
+
+def test_a_malformed_assistant_header_drops_its_record_and_reading_goes_on(tmp_path):
+    path = tmp_path / "transcript.md"
+    path.write_text(
+        "\n## assistant · step two · 2026-01-01T00:00:00Z\n$ lost\n"
+        "-> exit 0 · 1 chars · 1 lines · /logs/a.log\n"
+        "\n## assistant · step 4 · v2 · 2026-01-01T00:00:01Z\n```\n$ kept\n```\n"
+        "-> exit 0 · 1 chars · 1 lines · /logs/b.log\n",
+        encoding="utf-8",
+    )
+
+    assert Transcript(path, "abc").step_records() == [{
+        "step": 4, "commands": ["kept"],
+        "tool_stubs": ["-> exit 0 · 1 chars · 1 lines · /logs/b.log\n"]}]
+
+
 # --- the agent writing it ----------------------------------------------------------
 
 def test_agent_records_each_message_as_it_enters_the_context(tmp_path):
@@ -125,13 +252,14 @@ def test_agent_records_each_message_as_it_enters_the_context(tmp_path):
     assert text.count("\n## user · ") == 1
     task_text = render(load_config()["templates"]["instance"], task="say hi").rstrip("\n")
     assert task_text + "\n" in text
-    assert text.count("\n## assistant · step 1 · ") == 1
-    assert "\nChecking.\n$ printf 'hello\\nworld\\n'\n-> exit 0 · 12 chars · 3 lines · " in text
+    assert text.count("\n## assistant · step 1 · v2 · ") == 1
+    assert ("```text\nChecking.\n```\n```\n$ printf 'hello\\nworld\\n'\n```\n"
+            "-> exit 0 · 12 chars · 3 lines · ") in text
     stub = [line for line in text.splitlines() if line.startswith("-> exit 0")][0]
     log_path = stub.split(" · ")[-1]
     assert open(log_path).read() == "hello\nworld\n"
-    assert "\n## assistant · step 2 · " in text
-    assert "\ndeep thought\nDone.\n" in text
+    assert "\n## assistant · step 2 · v2 · " in text
+    assert "```text\ndeep thought\n```\n```text\nDone.\n```\n" in text
     assert "## system" not in text
     assert _pointer(state_file) not in text
 
@@ -211,3 +339,26 @@ def test_a_session_without_a_state_file_keeps_no_transcript(tmp_path):
     assert agent.messages[1]["content"] == render(
         load_config()["templates"]["reset_pointer"],
         transcript=str(tmp_path / "transcript.md"), session_dir=str(tmp_path))
+
+
+def test_a_resumed_run_has_its_own_step_limit_and_numbers_transcript_steps_on(tmp_path):
+    state_file = _state_file(tmp_path)
+    first = _agent(tmp_path, _Model(assistant(tool_calls=[tool_call(1, command="printf one")]),
+                                    assistant(tool_calls=[tool_call(1, command="printf two")])),
+                   state_file, step_limit=2)
+    with pytest.raises(RuntimeError, match="Step limit"):
+        first.run("two steps")
+
+    events = []
+    resumed = _agent(tmp_path, _Model(assistant(tool_calls=[tool_call(1, command="printf three")]),
+                                      assistant("done")),
+                     state_file, resume=True, step_limit=2, emit=events.append)
+    result = resumed.run("continue")
+
+    assert result["completed"] is True and result["n_steps"] == 2
+    assert [e["step"] for e in events if e["type"] == "context"] == [1, 2]
+    assert [e["id"] for e in events if e["type"] == "command"] == ["s-1-1"]
+    assert (tmp_path / "logs" / "s-1-1.log").read_text() == "three"
+    records = Transcript(state_file.with_suffix(".d") / "transcript.md", "abc").step_records()
+    assert [(r["step"], r["commands"]) for r in records] == [
+        (1, ["printf one"]), (2, ["printf two"]), (3, ["printf three"]), (4, [])]
