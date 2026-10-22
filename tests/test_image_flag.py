@@ -2,28 +2,29 @@
 
 Covers the zero-flag regression (string content), parts construction (text
 part = rendered instance template; image parts = data URLs whose base64
-round-trips to the file bytes, in flag order), the resume path, and the
-validation matrix (missing file, directory-as-file, bad suffix, oversize,
-five occurrences, inclusive 4 MiB boundary). All offline: Model.query is replaced by a one-reply fake
-that records its prompts, as in test_task_file.py.
+round-trips to the payload, in flag order), resume, image fitting, and the
+validation matrix. All images are generated at runtime, and Model.query is
+replaced by a one-reply fake that records its prompts.
 """
 
 import base64
+import io
 import json
 import re
 
 import pytest
 import typer
 from typer.testing import CliRunner
+from PIL import Image as PILImage
 
 import main as cli_main
-from agent import IMAGE_MIME, load_config, render
+from agent import IMAGE_MAX_EDGE, IMAGE_MIME, IMAGE_SIZE_LIMIT, load_config, render
 from conftest import assistant
 from model import Model
 
 
 def _cli_app():
-    app = typer.Typer()
+    app = typer.Typer(add_completion=False, rich_markup_mode=None)
     app.command()(cli_main.run)
     return app
 
@@ -69,9 +70,35 @@ def _write_image(tmp_path, name, payload):
     return str(path)
 
 
+def _image_bytes(image_format="PNG", size=(2, 2), color=(20, 40, 60)):
+    output = io.BytesIO()
+    PILImage.new("RGB", size, color).save(output, format=image_format)
+    return output.getvalue()
+
+
+def _write_oversize_jpeg(tmp_path, name="noise.jpg", orientation=None):
+    size = (4032, 3024)
+    image = PILImage.merge(
+        "RGB", tuple(PILImage.effect_noise(size, 100) for _ in range(3))
+    )
+    exif = PILImage.Exif()
+    if orientation is not None:
+        exif[274] = orientation
+    path = tmp_path / name
+    image.save(path, format="JPEG", quality=97, exif=exif)
+    assert path.stat().st_size > IMAGE_SIZE_LIMIT
+    return str(path)
+
+
+def _sent_image(seen):
+    url = seen[0][1]["content"][1]["image_url"]["url"]
+    prefix, encoded = url.split(",", 1)
+    mime = prefix.removeprefix("data:").removesuffix(";base64")
+    return mime, base64.b64decode(encoded)
+
+
 def _stderr_text(result):
-    """Error-panel text with box borders and line wrapping normalized away,
-    so cause fragments survive whichever way typer's rich panel wraps."""
+    """Normalize output whitespace so cause fragments stay easy to assert."""
     flattened = re.sub(r"[\u2500-\u257f]+", " ", result.stderr)
     return " ".join(flattened.split())
 
@@ -101,7 +128,10 @@ def test_no_image_keeps_the_plain_string_content(tmp_path, monkeypatch):
 @pytest.mark.parametrize("count", [1, 2])
 def test_images_become_parts_in_flag_order(tmp_path, monkeypatch, count):
     seen = _capture_model(monkeypatch)
-    specs = [("first.PNG", b"png-payload-one"), ("second.jpg", b"jpeg-payload-two")]
+    specs = [
+        ("first.PNG", _image_bytes("PNG", color=(255, 0, 0))),
+        ("second.jpg", _image_bytes("JPEG", color=(0, 255, 0))),
+    ]
     flags = []
     for name, payload in specs[:count]:
         flags += ["--image", _write_image(tmp_path, name, payload)]
@@ -134,7 +164,7 @@ def test_resume_turn_carries_image_parts(tmp_path, monkeypatch):
     assert first.exit_code == 0, first.output
     session_id = json.loads(first.stdout.splitlines()[0])["session_id"]
 
-    payload = b"resume-shot-bytes"
+    payload = _image_bytes("PNG", color=(0, 0, 255))
     image = _write_image(tmp_path, "shot.png", payload)
     task_path.write_text("turn two, now with a picture", encoding="utf-8")
     second = _invoke(runner, tmp_path, task_path,
@@ -176,33 +206,90 @@ def test_bad_suffix_is_rejected(tmp_path):
     _assert_image_rejected(result, "unsupported suffix", "'.bmp'")
 
 
-def test_oversize_image_is_rejected(tmp_path):
-    payload = b"x" * (4 * 1024 * 1024 + 1)
-    huge = _write_image(tmp_path, "huge.png", payload)
-    result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"),
-                     ["--image", huge])
-    _assert_image_rejected(result, str(len(payload)), str(cli_main.IMAGE_SIZE_LIMIT))
-
-
-def test_exactly_four_mib_is_accepted(tmp_path, monkeypatch):
-    """The size limit is inclusive: 4 MiB on the nose is a legal image."""
+def test_oversize_jpeg_is_fitted_to_a_small_jpeg_part(tmp_path, monkeypatch):
     seen = _capture_model(monkeypatch)
-    payload = b"y" * (4 * 1024 * 1024)
+    image = _write_oversize_jpeg(tmp_path)
+
+    result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"),
+                     ["--image", image])
+
+    assert result.exit_code == 0, result.output
+    mime, payload = _sent_image(seen)
+    assert mime == "image/jpeg"
+    assert len(payload) <= IMAGE_SIZE_LIMIT
+    with PILImage.open(io.BytesIO(payload)) as fitted:
+        assert max(fitted.size) <= IMAGE_MAX_EDGE
+
+
+def test_oversize_jpeg_exif_orientation_is_applied(tmp_path, monkeypatch):
+    seen = _capture_model(monkeypatch)
+    image = _write_oversize_jpeg(tmp_path, orientation=6)
+
+    result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"),
+                     ["--image", image])
+
+    assert result.exit_code == 0, result.output
+    mime, payload = _sent_image(seen)
+    assert mime == "image/jpeg"
+    with PILImage.open(io.BytesIO(payload)) as fitted:
+        assert fitted.height > fitted.width
+
+
+def test_oversize_jpeg_fits_when_pillow_pixel_limit_is_low(
+    tmp_path, monkeypatch
+):
+    seen = _capture_model(monkeypatch)
+    monkeypatch.setattr(PILImage, "MAX_IMAGE_PIXELS", 1000)
+    image = _write_oversize_jpeg(tmp_path)
+
+    result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"),
+                     ["--image", image])
+
+    assert result.exit_code == 0, result.output
+    mime, payload = _sent_image(seen)
+    assert mime == "image/jpeg"
+    assert len(payload) <= IMAGE_SIZE_LIMIT
+
+
+def test_oversize_non_image_is_rejected_as_plain_text(tmp_path):
+    payload = b"not an image" + b"x" * IMAGE_SIZE_LIMIT
+    image = _write_image(tmp_path, "broken.jpg", payload)
+    result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"),
+                     ["--image", image])
+
+    _assert_image_rejected(result, "cannot be decoded as an image")
+    output = result.output
+    lines = output.splitlines()
+    assert lines[0].startswith("Usage:")
+    assert lines[1].startswith("Try ")
+    assert lines[2] == ""
+    assert lines[3].startswith("Error: ")
+    assert "cannot be decoded as an image" in output
+    assert "╭" not in output
+
+
+def test_exactly_four_mib_is_sent_byte_identical(tmp_path, monkeypatch):
+    """The size limit is inclusive: 4 MiB on the nose is sent unchanged."""
+    seen = _capture_model(monkeypatch)
+    payload = _image_bytes("PNG")
+    payload += b"\0" * (IMAGE_SIZE_LIMIT - len(payload))
     image = _write_image(tmp_path, "exact.png", payload)
 
     result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"),
                      ["--image", image])
 
     assert result.exit_code == 0, result.output
-    url = seen[0][1]["content"][1]["image_url"]["url"]
-    prefix = "data:image/png;base64,"
-    assert url.startswith(prefix)
-    assert base64.b64decode(url[len(prefix):]) == payload
+    mime, sent = _sent_image(seen)
+    assert mime == "image/png"
+    assert sent == payload
 
 
 def test_five_occurrences_exceed_the_count_cap(tmp_path):
     flags = []
     for index in range(5):
-        flags += ["--image", _write_image(tmp_path, f"pic{index}.png", b"tiny")]
+        flags += [
+            "--image",
+            _write_image(tmp_path, f"pic{index}.png", _image_bytes("PNG")),
+        ]
     result = _invoke(CliRunner(), tmp_path, _write_task(tmp_path, "look"), flags)
     _assert_image_rejected(result, "5th", "at most 4")

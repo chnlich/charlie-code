@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "litellm",
+    "pillow",
     "pyyaml",
     "typer",
 ]

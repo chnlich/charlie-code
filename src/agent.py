@@ -32,6 +32,7 @@ left unanswered.
 """
 
 import base64
+import io
 import json
 import os
 import sys
@@ -39,8 +40,10 @@ import tempfile
 import time
 from pathlib import Path
 
+import typer
 import yaml
 from litellm.exceptions import ContextWindowExceededError
+from PIL import Image, ImageOps
 
 from compact import (
     EXPIRY_BATCH_TOKEN_THRESHOLD,
@@ -71,6 +74,50 @@ IMAGE_MIME = {
     "gif": "image/gif",
     "webp": "image/webp",
 }
+IMAGE_SIZE_LIMIT = 4 * 1024 * 1024
+IMAGE_MAX_EDGE = 2000
+
+
+def image_payload(path):
+    """Return the MIME type and bytes sent for an image path."""
+    path = Path(path)
+    mime = IMAGE_MIME[path.suffix.lower().lstrip(".")]
+    raw = path.read_bytes()
+    if len(raw) <= IMAGE_SIZE_LIMIT:
+        return mime, raw
+
+    raw_size = len(raw)
+    try:
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(path) as image:
+            if image.format == "JPEG":
+                image.draft("RGB", (IMAGE_MAX_EDGE, IMAGE_MAX_EDGE))
+            image.seek(0)
+            image.load()
+            image = ImageOps.exif_transpose(image)
+            if "A" in image.getbands() or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                flattened = Image.new("RGB", rgba.size, "white")
+                flattened.paste(rgba, mask=rgba.getchannel("A"))
+                image = flattened
+            else:
+                image = image.convert("RGB")
+            image.thumbnail((IMAGE_MAX_EDGE, IMAGE_MAX_EDGE))
+            fitted = io.BytesIO()
+            image.save(fitted, format="JPEG", quality=85)
+    except (OSError, ValueError, SyntaxError, EOFError):
+        raise typer.BadParameter(
+            f"--image: {str(path)!r} cannot be decoded as an image"
+        ) from None
+
+    fitted_bytes = fitted.getvalue()
+    if len(fitted_bytes) > IMAGE_SIZE_LIMIT:
+        raise typer.BadParameter(
+            f"--image: {str(path)!r} is {raw_size} bytes; fitted JPEG is "
+            f"{len(fitted_bytes)} bytes, over the {IMAGE_SIZE_LIMIT}-byte "
+            "limit (4 MiB)"
+        )
+    return "image/jpeg", fitted_bytes
 
 BASH_TOOL = {
     "type": "function",
@@ -861,9 +908,9 @@ class Agent:
 
         With images attached, content becomes a parts list: the rendered
         instance template first, then one image_url part per image in flag
-        order, each a base64 data URL. Each file is read here, at message-build
-        time; the CLI already validated existence, readability, suffix, and
-        size before the Agent existed. Without images the message stays
+        order, each a base64 data URL. The CLI validates each path before
+        constructing the Agent; this method obtains the same MIME and payload.
+        Without images the message stays
         exactly the string-content form. Either way it persists verbatim: a
         reset carries it over as it is, resume replays it as-is.
         """
@@ -872,8 +919,7 @@ class Agent:
             return {"role": "user", "content": text}
         parts = [{"type": "text", "text": text}]
         for path in self.images:
-            raw = Path(path).read_bytes()
-            mime = IMAGE_MIME[Path(path).suffix.lower().lstrip(".")]
+            mime, raw = image_payload(path)
             encoded = base64.b64encode(raw).decode("ascii")
             parts.append({
                 "type": "image_url",

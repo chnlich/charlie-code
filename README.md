@@ -28,7 +28,7 @@ modules by the build backend, so after install `import agent` / `import model` /
 ## Install
 
 ```bash
-pip install -e .          # runtime: litellm, pyyaml, typer
+pip install -e .          # runtime: litellm, pillow, pyyaml, typer
 pip install -e ".[dev]"   # also installs pytest for the smoke test
 ```
 
@@ -54,10 +54,11 @@ charlie-code --task-file TASK.md [--image PATH ...] [--model M] [--api-base URL]
   contents verbatim.
 - `--image PATH` (repeatable, up to 4) attaches an image to the task message:
   each PATH must be a readable file whose suffix is one of `png`, `jpg`,
-  `jpeg`, `gif`, `webp`, and at most 4 MiB. The task message then carries the
-  rendered task text plus one base64 `image_url` part per image, in the order
-  given; with no `--image` the message is the plain-text form. Images persist
-  verbatim in the session history and resume unchanged.
+  `jpeg`, `gif`, `webp`. A file over 4 MiB is downscaled to a JPEG with a
+  2000 px long edge. The task message then carries the rendered task text plus
+  one base64 `image_url` part per image, in the order given; with no `--image`
+  the message is the plain-text form. Images persist verbatim in the session
+  history and resume unchanged.
 - `--cwd` is the repo the agent operates in (default: current directory).
 - `--instructions-file PATH` appends the file's full UTF-8 text to the system
   message of a fresh session; see the next section for its place in the system
